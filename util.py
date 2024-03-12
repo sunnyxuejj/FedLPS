@@ -3,8 +3,9 @@ import os
 import torch
 import numpy as np
 from torchvision import datasets, transforms
-from sampling import mnist_extr_noniid, cifar_extr_noniid
-from dataset import DatasetSplit
+from sampling import mnist_extr_noniid, cifar_extr_noniid, cifar100_extr_noniid, tiny_extr_noniid
+from dataset import DatasetSplit, tiny
+
 
 def repackage_hidden(h):
     """Wraps hidden states in new Tensors,
@@ -77,4 +78,41 @@ def get_dataset_cifar10_extr_noniid(num_users, n_class, nsamples, rate_unbalance
 
     # Chose euqal splits for every user
     user_groups_train, user_groups_test = cifar_extr_noniid(train_dataset, test_dataset, num_users, n_class, nsamples, rate_unbalance)
+    return train_dataset, test_dataset, user_groups_train, user_groups_test
+
+
+def get_dataset_cifar100_extr_noniid(num_users, n_class, nsamples, rate_unbalance):
+    data_dir = './data/cifar100/'
+    os.makedirs(data_dir, exist_ok=True)
+    apply_transform = transforms.Compose(
+        [transforms.ToTensor(),
+         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
+    train_dataset = datasets.CIFAR100(data_dir, train=True, download=True,
+                                      transform=apply_transform)
+
+    test_dataset = datasets.CIFAR100(data_dir, train=False, download=True,
+                                     transform=apply_transform)
+    # Chose euqal splits for every user
+    user_groups_train, user_groups_test = cifar100_extr_noniid(train_dataset, test_dataset, num_users, n_class, nsamples, rate_unbalance)
+    return train_dataset, test_dataset, user_groups_train, user_groups_test
+
+
+def get_dataset_tiny_extr_noniid(num_users, n_class, nsamples, rate_unbalance):
+    data_dir = './data/tiny_imagenet'
+    os.makedirs(data_dir, exist_ok=True)
+    CIFAR_MEAN = [0.5, 0.5, 0.5]
+    CIFAR_STD = [0.5, 0.5, 0.5]
+    transform_train = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+    ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+    ])
+    train_dataset = tiny(data_dir, train=True, transform=transform_train, download=True)
+    test_dataset = tiny(data_dir, train=False, transform=transform_test, download=True)
+    # Chose euqal splits for every user
+    user_groups_train, user_groups_test = tiny_extr_noniid(train_dataset, test_dataset, num_users, n_class, nsamples, rate_unbalance)
     return train_dataset, test_dataset, user_groups_train, user_groups_test

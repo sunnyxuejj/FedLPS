@@ -43,7 +43,7 @@ def evaluate(args, data_loader, model, device):
 
 class Client:
 
-    def __init__(self, args, device, id, train_data, val_data, test_data, local_net):
+    def __init__(self, args, device, id, train_data, val_data, test_data, local_net, mask_rate=1):
         '''Construct a new client.
 
         Parameters:
@@ -78,20 +78,18 @@ class Client:
         # for LTH pruning later.
         self.local_net = local_net.to(device)
         self.model_trans = copy.deepcopy(self.local_net)
+        self.mask_rate = mask_rate
 
-        if self.args.dataset == 'reddit' or self.args.dataset == 'cifar10':
+        if self.args.dataset == 'reddit' or self.args.dataset == 'cifar10' or self.args.dataset == 'cifar100' or self.args.dataset == 'tinyimagenet':
             self.loss_func = nn.CrossEntropyLoss().to(self.device)
         else:
             self.loss_func = nn.NLLLoss().to(self.device)
         self.reset_optimizer()
 
+        self.train_data = train_data
         self.traindata_loader = DataLoader(train_data, batch_size=self.args.local_bs, shuffle=True)
-        if args.dataset == 'reddit':
-            self.valdata_loader = DataLoader(val_data, batch_size=1, shuffle=False)
-            self.testdata_loader = DataLoader(test_data, batch_size=1, shuffle=False)
-        else:
-            self.valdata_loader = DataLoader(val_data, batch_size=self.args.local_bs, shuffle=False)
-            self.testdata_loader = DataLoader(test_data, batch_size=self.args.local_bs, shuffle=False)
+        self.valdata_loader = DataLoader(val_data, batch_size=self.args.local_bs, shuffle=False)
+        self.testdata_loader = DataLoader(test_data, batch_size=self.args.local_bs, shuffle=False)
 
     def reset_optimizer(self, round=0):
         if self.args.optimizer == 'sgd':

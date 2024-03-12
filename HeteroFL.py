@@ -2,25 +2,29 @@
 # -*- coding: utf-8 -*-
 # @python: 3.8
 import os
-import copy
-import numpy as np
+
 import torch.nn as nn
 import pickle
-import torch
+
 from torch.utils.data import DataLoader
 from collections import OrderedDict
+from agg.avg import *
 from Text import DatasetLM
-from FedLPS import make_model_rate, evaluate
+from FedLPS import make_model_rate
 from utils.options import args_parser
-from util import get_dataset_mnist_extr_noniid, get_dataset_cifar10_extr_noniid, train_val_test_image, repackage_hidden
+from util import get_dataset_mnist_extr_noniid, get_dataset_cifar10_extr_noniid, get_dataset_cifar100_extr_noniid, \
+    get_dataset_tiny_extr_noniid, train_val_test_image, repackage_hidden
 from utils.main_flops_counter import count_training_flops
+from dataset import DatasetSplit
 from Models import all_models
 from data.reddit.user_data import data_process
+from Client import Client, evaluate
 import warnings
 
 warnings.filterwarnings('ignore')
 
 args = args_parser()
+FLOPS_capacity = [46528.0, 93056.0, 186112.0, 372224.0, 744448.0]
 
 
 def split_model(w_server, local_net):
@@ -61,69 +65,13 @@ def split_model(w_server, local_net):
     return local_params, idx
 
 
-class Client:
+class Client_HeteroFL(Client):
 
-    def __init__(self, args, device, id, train_data, val_data, test_data, local_net, mask_rate=1):
-        '''Construct a new client.
+    def __init__(self, *args, **kwargs):
+        super(Client_HeteroFL, self).__init__(*args, **kwargs)
+        self.roll_rate = self.mask_rate
 
-        Parameters:
-        args:
-            related parameters settings
-        device: 'cpu' or 'cuda'
-            running device label
-        id : object
-            a unique identifier for this client.
-        train_data : iterable of tuples of (x, y)
-            a DataLoader or other iterable giving us training samples.
-        val_data : iterable of tuples of (x, y)
-            a DataLoader or other iterable giving us validation samples.
-        test_data : iterable of tuples of (x, y)
-            a DataLoader or other iterable giving us test samples.
-            (we will use this as the validation set.)
-        initial_global_params : dict
-            initial global model parameters
-        lr: float
-            current learning rate
-
-        Returns: a new client.
-        '''
-
-        self.args = args
-        self.device = device
-        self.id = id
-        self.roll_rate = mask_rate
-        self.train_data, self.val_data, self.test_data = train_data, val_data, test_data
-        self.criterion = nn.CrossEntropyLoss()
-
-        self.learning_rate = args.lr
-
-        self.local_epochs = args.local_ep
-        self.curr_round = 0
-
-        # save the initial global params given to us by the server
-        # for LTH pruning later.
-        self.local_net = local_net.to(device)
-
-        if self.args.dataset == 'reddit' or self.args.dataset == 'cifar10':
-            self.loss_func = nn.CrossEntropyLoss().to(self.device)
-        else:
-            self.loss_func = nn.NLLLoss().to(self.device)
-        self.reset_optimizer()
-
-        self.traindata_loader = DataLoader(train_data, batch_size=self.args.local_bs, shuffle=True)
-        self.valdata_loader = DataLoader(val_data, batch_size=self.args.local_bs, shuffle=True)
-        self.testdata_loader = DataLoader(test_data, batch_size=self.args.local_bs, shuffle=True)
-
-    def reset_optimizer(self, round=0):
-        if self.args.optimizer == 'sgd':
-            self.optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, self.local_net.parameters()),
-                                             lr=self.args.lr * (self.args.lr_decay ** round),
-                                             momentum=self.args.momentum, weight_decay=self.args.wdecay)
-        elif self.args.optimizer == 'adam':
-            self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.local_net.parameters()),
-                                              lr=self.learning_rate, weight_decay=self.args.wdecay)
-
-    def update_weights(self, w_server, round, lr=None):
+    def update_weights_HeteroFL(self, w_server, round, lr=None):
         '''Train the client network for a single round.'''
         self.local_net = all_models[self.args.dataset](config, device, self.roll_rate)
         local_params, idx = split_model(w_server, self.local_net)
@@ -200,8 +148,8 @@ def combine(w_glob, w_locals, param_idxs, tmp_counts):
     updated_parameters = copy.deepcopy(w_glob)
     for k, v in updated_parameters.items():
         parameter_type = k.split('.')[-1]
-        count[k] = v.new_zeros(v.size(), dtype=torch.float32, device='cpu')
-        tmp_v = v.new_zeros(v.size(), dtype=torch.float32, device='cpu')
+        count[k] = v.new_zeros(v.size(), dtype=torch.float32, device=v.device)
+        tmp_v = v.new_zeros(v.size(), dtype=torch.float32, device=v.device)
         for m in range(len(w_locals)):
             if 'weight' in parameter_type or 'bias' in parameter_type:
                 if v.dim() > 1:
@@ -223,6 +171,8 @@ def combine(w_glob, w_locals, param_idxs, tmp_counts):
 
 if __name__ == "__main__":
     config = args
+    config.clip = 5
+    config.momentum = 0
 
     torch.cuda.set_device(args.gpu)
     torch.manual_seed(args.seed)
@@ -234,27 +184,7 @@ if __name__ == "__main__":
     config.device = device
 
     dataset_train, dataset_val, dataset_test, data_num = {}, {}, {}, {}
-    if args.dataset == 'reddit':
-        # dataload
-        data_dir = './data/reddit/train/'
-        with open('./data/reddit/reddit_vocab.pck', 'rb') as f:
-            vocab = pickle.load(f)
-        nvocab = vocab['size']
-        config.nvocab = nvocab
-        train_data, val_data, test_data = data_process(data_dir, nvocab, args.nusers)
-        for i in range(args.nusers):
-            dataset_train[i] = DatasetLM(train_data[i], vocab['vocab'])
-            dataset_val[i] = DatasetLM(val_data[i], vocab['vocab'])
-            dataset_test[i] = DatasetLM(test_data[i], vocab['vocab'])
-            data_num[i] = len(train_data[i])
-        all_val, all_test = [], []
-        for value in val_data.values():
-            for sent in value:
-                all_val.append(sent)
-        for value in test_data.values():
-            for sent in value:
-                all_test.append(sent)
-    elif args.dataset == 'mnist':
+    if args.dataset == 'mnist':
         idx_vals = []
         total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_mnist_extr_noniid(
             args.nusers,
@@ -272,6 +202,52 @@ if __name__ == "__main__":
     elif args.dataset == 'cifar10':
         idx_vals = []
         total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_cifar10_extr_noniid(
+            args.nusers,
+            args.nclass,
+            args.nsamples,
+            args.rate_unbalance)
+        for i in range(args.nusers):
+            idx_val, dataset_train[i], dataset_val[i], dataset_test[i] = train_val_test_image(total_train_data,
+                                                                                              list(
+                                                                                                  dataset_train_idx[i]),
+                                                                                              total_test_data,
+                                                                                              list(dataset_test_idx[i]))
+            idx_vals.append(idx_val)
+            data_num[i] = len(dataset_train[i])
+        val_list = [i for item in idx_vals for i in item]
+        loader_val = DataLoader(DatasetSplit(total_train_data, val_list), batch_size=args.bs, shuffle=True)
+        loader_test = DataLoader(total_test_data, batch_size=args.bs, shuffle=True)
+    elif args.dataset == 'cifar100':
+        idx_vals = []
+        total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_cifar100_extr_noniid(
+            args.nusers,
+            args.nclass,
+            args.nsamples,
+            args.rate_unbalance)
+        for i in range(args.nusers):
+            idx_val, dataset_train[i], dataset_val[i], dataset_test[i] = train_val_test_image(total_train_data,
+                                                                                              list(
+                                                                                                  dataset_train_idx[i]),
+                                                                                              total_test_data,
+                                                                                              list(dataset_test_idx[i]))
+            idx_vals.append(idx_val)
+            data_num[i] = len(dataset_train[i])
+    elif args.dataset == 'reddit':
+        # dataload
+        data_dir = './data/reddit/train/'
+        with open('./data/reddit/reddit_vocab.pck', 'rb') as f:
+            vocab = pickle.load(f)
+        nvocab = vocab['size']
+        config.nvocab = nvocab
+        train_data, val_data, test_data = data_process(data_dir, nvocab, args.nusers)
+        for i in range(args.nusers):
+            dataset_train[i] = DatasetLM(train_data[i], vocab['vocab'])
+            dataset_val[i] = DatasetLM(val_data[i], vocab['vocab'])
+            dataset_test[i] = DatasetLM(test_data[i], vocab['vocab'])
+            data_num[i] = len(train_data[i])
+    elif args.dataset == 'tinyimagenet':
+        idx_vals = []
+        total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_tiny_extr_noniid(
             args.nusers,
             args.nclass,
             args.nsamples,
@@ -306,25 +282,20 @@ if __name__ == "__main__":
     rate_idx = torch.multinomial(torch.tensor(config.proportion).float(), num_samples=config.nusers,
                                  replacement=True).tolist()
     clients_mask_rate = np.array(config.mask_rate_list)[rate_idx]
+    client_capacity = np.array(FLOPS_capacity)[rate_idx]
     for client_id in range(args.nusers):
-        cl = Client(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
-                    dataset_test[client_id],
-                    local_net=all_models[args.dataset](config, device), mask_rate=clients_mask_rate[client_id])
+        cl = Client_HeteroFL(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
+                             dataset_test[client_id],
+                             local_net=all_models[args.dataset](config, device), mask_rate=clients_mask_rate[client_id])
         clients[client_id] = cl
         client_ids.append(client_id)
         torch.cuda.empty_cache()
 
-    # we need to accumulate compute/DL/UL costs regardless of round number, resetting only
-    # when we actually report these numbers
-    compute_flops = np.zeros(len(clients))  # the total floating operations for each client
-    download_cost = np.zeros(len(clients))
-    upload_cost = np.zeros(len(clients))
-
     for round in range(args.rounds):
-        clients_mask_rate = make_model_rate(config, clients_mask_rate)
-        upload_cost_round = []
-        download_cost_round = []
-        compute_flops_round = []
+        clients_mask_rate, client_capacity = make_model_rate(config, clients_mask_rate, client_capacity)
+        upload_cost_round, uptime = [], []
+        download_cost_round, down_time = [], []
+        compute_flops_round, training_time = [], []
 
         net_glob.train()
         w_locals, param_idxs, avg_weight, loss_locals, acc_locals = [], [], [], [], []
@@ -335,19 +306,19 @@ if __name__ == "__main__":
             client = clients[idx]
             i = client_ids.index(idx)
             client.roll_rate = clients_mask_rate[i]
-            train_result = client.update_weights(w_server=copy.deepcopy(w_glob), round=round)
+            train_result = client.update_weights_HeteroFL(w_server=copy.deepcopy(w_glob), round=round)
             w_locals.append(train_result['state'])
             param_idxs.append(train_result['params_idx'])
             avg_weight.append(data_num[idx])
             loss_locals.append(train_result['loss'])
             acc_locals.append(train_result['acc'])
 
-            download_cost[i] += train_result['dl_cost']
             download_cost_round.append(train_result['dl_cost'])
-            upload_cost[i] += train_result['ul_cost']
+            down_time.append(train_result['dl_cost'] / 8 / 1024 / 1024 / 110.6)
             upload_cost_round.append(train_result['ul_cost'])
-            compute_flops[i] += train_result['train_flops']
+            uptime.append(train_result['ul_cost'] / 8 / 1024 / 1024 / 14.0)
             compute_flops_round.append(train_result['train_flops'])
+            training_time.append(train_result['train_flops'] / 1e6 / client_capacity[idx])
 
         w_glob, tmp_counts = combine(w_glob, w_locals, param_idxs, tmp_counts)
         net_glob.load_state_dict(w_glob)
@@ -365,15 +336,18 @@ if __name__ == "__main__":
             per_test_res = evaluate(config, c.testdata_loader, net_glob, device)
             per_test_loss.append(per_test_res[0])
             per_test_acc.append(per_test_res[1])
-        print('\nTrain loss: {:.5f}, train accuracy: {:.5f}'.format(sum(train_loss) / len(train_loss),
-                                                                    sum(train_acc) / len(train_acc)))
+        print('\nRound {}, Train loss: {:.5f}, train accuracy: {:.5f}'.format(round, sum(train_loss) / len(train_loss),
+                                                                    sum(train_acc) / len(train_acc)), flush=True)
         print('Max upload cost: {:.3f} MB, Max download cost: {:.3f} '
               'MB'.format(max(upload_cost_round) / 8 / 1024 / 1024, max(download_cost_round) / 8 / 1024 / 1024))
         print('Sum compute flops cost: {:.3f} MB'.format(sum(compute_flops_round) / 1e6))
+        print('Max time for upload time: {:.5f} s, Max time for download: {:.5f} s'.format(max(uptime),
+                                                                                               max(down_time)))
+        print('Max local training time: {:.5f} s'.format(max(training_time)))
 
-        print("Global Round {}, Validation loss: {:.5f}, "
-              "val accuracy: {:.5f}".format(round, sum(val_loss) / len(val_loss),
+        print("Validation loss: {:.5f}, "
+              "val accuracy: {:.5f}".format(sum(val_loss) / len(val_loss),
                                             sum(val_acc) / len(val_acc)))
-        print("Global Round {}, test loss: {:.5f}, "
-              "test accuracy: {:.5f}".format(round, sum(per_test_loss) / len(per_test_loss),
-                                             sum(per_test_acc) / len(per_test_acc)))
+        print("test loss: {:.5f}, "
+              "test accuracy: {:.5f}".format(sum(per_test_loss) / len(per_test_loss),
+                                             sum(per_test_acc) / len(per_test_acc)), flush=True)

@@ -102,7 +102,7 @@ class Hetero_Client:
         self.first_layer = layers_name[0]
         self.last_layer = layers_name[-1]
 
-        if self.args.dataset == 'reddit' or self.args.dataset == 'cifar10':
+        if self.args.dataset == 'reddit' or self.args.dataset == 'cifar10' or self.args.dataset == 'cifar100' or self.args.dataset == 'tinyimagenet':
             self.loss_func = nn.CrossEntropyLoss().to(self.device)
         elif self.args.dataset == 'mnist':
             self.loss_func = nn.NLLLoss().to(self.device)

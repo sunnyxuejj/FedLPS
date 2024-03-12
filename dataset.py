@@ -22,179 +22,138 @@ class DatasetSplit(Dataset):
         return torch.tensor(image), torch.tensor(label)
 
 
-class MiniImagenetDataset(Dataset):
-    def __init__(self, mode = 'train', root = '..', transform = None):
-        super(MiniImagenetDataset, self).__init__()
-        self.root = root
-        self.mode = mode
-        self.transforms = transform
-        path_image_data = os.path.join(root, 'data_{}.npy'.format(mode))
-        path_targets = os.path.join(root, 'targets_{}.npy'.format(mode))
-        image_data = np.load(path_image_data)
-        targets = np.load(path_targets)
-        self.images = image_data
-        self.targets = targets
-
-    def __getitem__(self, index):
-        return self.transforms(self.images[index]), self.targets[index]
-
-    def __len__(self):
-        return self.images.shape[0]
+from PIL import Image
+import os
+import os.path
+import pickle
+import torch
+import torchvision
+from typing import Any, Callable, Optional, Tuple
 
 
-class FemnistDataset(Dataset):
-    def __init__(self, data_x, data_y, transform = None):
-        self.data = np.asarray(data_x, dtype=np.float32).reshape(-1, 28, 28, 1)
-        self.labels = torch.LongTensor(data_y)
-        self.transform = transform
-    def __getitem__(self,  index):
-        image = self.data[index]
-        if(self.transform is not None):
-            image = self.transform(image)
-        label = self.labels[index]
-        return image, label
-    def __len__(self):
-        return len(self.labels)
+class tiny(torchvision.datasets.VisionDataset):
 
 
-def read_data_json(data_dir):
-    user_group_train = {}
-    user_group_test = {}
-    users_list = []
-    data_x_train = []
-    data_y_train = []
-    data_x_test = []
-    data_y_test = []
-    num_users_train_total = 0
-    num_sample_train_total = 0
-    num_users_test_total = 0
-    num_sample_test_total = 0
-    #handle train data first
-    files = os.listdir(os.path.join(data_dir, 'train'))
-    files = [f for f in files if f.endswith('.json')]
-    for f in files:
-        file_path = os.path.join(data_dir, 'train' ,f)
-        #handle json files
-        with open(file_path, 'r') as inf:
-            cdata = json.load(inf)
-        #users in this json file
-        users = cdata.get('users')
-        raw_data = cdata.get('user_data')
-        users_list.extend(users)
-        for i in range(len(users)):
-            #handle each user
-            data_x_train.extend(raw_data.get(users[i]).get('x'))
-            data_y_train.extend(raw_data.get(users[i]).get('y'))
-            user_group_train[num_users_train_total] = [i + num_sample_train_total for i in range(cdata.get('num_samples')[i])]
-            assert cdata.get('num_samples')[i] == len(raw_data.get(users[i]).get('x'))
-            num_users_train_total += 1
-            num_sample_train_total += cdata.get('num_samples')[i]
-    #handle test data
-    files = os.listdir(os.path.join(data_dir, 'test'))
-    files = [f for f in files if f.endswith('.json')]
-    for f in files:
-        file_path = os.path.join(data_dir, 'test',f)
-        #handle json files
-        with open(file_path, 'r') as inf:
-            cdata = json.load(inf)
-        #users in this json file
-        users = cdata.get('users')
-        raw_data = cdata.get('user_data')
-        for i in range(len(users)):
-            #handle each user
-            data_x_test.extend(raw_data.get(users[i]).get('x'))
-            data_y_test.extend(raw_data.get(users[i]).get('y'))
-            user_group_test[users_list.index(users[i])] = [i + num_sample_test_total for i in range(cdata.get('num_samples')[i])]
-            assert cdata.get('num_samples')[i] == len(raw_data.get(users[i]).get('x'))
-            num_users_test_total += 1
-            num_sample_test_total += cdata.get('num_samples')[i]
-    
-    assert len(user_group_train) == len(user_group_test)
-    print("there are {} users\n".format(len(user_group_train)))
-    assert len(data_x_train) == len(data_y_train)
-    assert len(data_x_test) == len(data_y_test)
-    #print(len(user_group_train))
-    #print('\n')
-    #print(user_group_test)
-    return data_x_train, data_y_train, user_group_train, data_x_test, data_y_test, user_group_test
+    def __init__(
+            self,
+            root: str,
+            train: bool = True,
+            transform: Optional[Callable] = None,
+            target_transform: Optional[Callable] = None,
+            download: bool = False,
+    ) -> None:
+
+        super(tiny, self).__init__(root, transform=transform,
+                                      target_transform=target_transform)
+
+        self.train = train  # training set or test set
+        self.data: Any = []
+        self.targets = []
+
+        # if self.train:
+        #     downloaded_list = self.train_list
+        # else:
+        #     downloaded_list = self.test_list
+
+        # now load the picked numpy arrays
+
+        root_dir = root + '/tiny-imagenet-200'
+        self.identity = root_dir + "/tiny" + str(self.train) + ".pkl"
+        if os.path.exists(self.identity):
+            tmp_file = open(self.identity, 'rb')
+            read_data = pickle.load(tmp_file)
+            self.data = read_data[0]
+            self.targets = read_data[1]
+            tmp_file.close()
+        else:
+            trn_img_list, trn_lbl_list, tst_img_list, tst_lbl_list = [], [], [], []
+            trn_file = os.path.join(root_dir, 'train_list.txt')
+            tst_file = os.path.join(root_dir, 'val_list.txt')
+            with open(trn_file) as f:
+                line_list = f.readlines()
+                for line in line_list:
+                    img, lbl = line.strip().split()
+                    trn_img_list.append(img)
+                    trn_lbl_list.append(int(lbl))
+            with open(tst_file) as f:
+                line_list = f.readlines()
+                for line in line_list:
+                    img, lbl = line.strip().split()
+                    tst_img_list.append(img)
+                    tst_lbl_list.append(int(lbl))
+            self.root_dir = root_dir
+            if self.train:
+                self.img_list = trn_img_list
+                self.label_list = trn_lbl_list
+
+            else:
+                self.img_list = tst_img_list
+                self.label_list = tst_lbl_list
+
+            self.size = len(self.img_list)
+
+            self.transform = transform
+            # if self.train:
+            #     tmp = DatasetFromDir(img_root=root_dir, img_list=trn_img_list, label_list=trn_lbl_list,
+            #                           transformer=transform)
+            # else:
+            #     tmp = DatasetFromDir(img_root=root_dir, img_list=tst_img_list, label_list=tst_lbl_list,
+            #                          transformer=transform)
+            # self.data = tmp.img
+            # self.img_id = tmp.img_id
+            for index in range(self.size):
+                img_name = self.img_list[index % self.size]
+            # ********************
+                img_path = os.path.join(self.root_dir, img_name)
+                img_id = self.label_list[index % self.size]
+                img_raw = Image.open(img_path).convert('RGB')
+                self.data.append(np.asarray(img_raw))
+                self.targets.append(img_id)
+                # if index % 1000 == 999:
+                #     print('Load PIL images ' + str(self.train) + ': No.', index)
+
+            self.data = np.vstack(self.data).reshape(-1,3,64,64)
+            self.data = self.data.transpose((0,2,3,1))
+            tmp_file = open(self.identity, 'wb')
+            pickle.dump([self.data, self.targets], tmp_file)
+            tmp_file.close()
 
 
-class HARDataset(Dataset):
-    def __init__(self, data_x, data_y, transform = None):
-        self.data = torch.from_numpy(data_x).float()
-        self.targets = torch.LongTensor(data_y)
-        self.transform = transform
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        """
+        Args:
+            index (int): Index
 
-    def __getitem__(self,  index):
-        feature = self.data[index]
-        if(self.transform is not None):
-            feature = self.transform(feature)
-        label = self.targets[index]
-        return feature, label
+        Returns:
+            tuple: (image, target) where target is index of the target class.
+        """
+        # img, target = self.data[index], self.targets[index]
+        #
+        # # doing this so that it is consistent with all other datasets
+        # # to return a PIL Image
+        # img = Image.fromarray(img)
+        #
+        # if self.transform is not None:
+        #     img = self.transform(img)
+        #
+        # if self.target_transform is not None:
+        #     target = self.target_transform(target)
+        #
+        # return img, target
+        img, target = self.data[index], self.targets[index]
 
-    def __len__(self):
-        return len(self.targets)
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        img = Image.fromarray(img)
 
+        if self.transform is not None:
+            img = self.transform(img)
 
-def load_file(filepath):
-    dataframe = pd.read_csv(filepath, header=None, delim_whitespace=True)
-    return dataframe.values
+        if self.target_transform is not None:
+            target = self.target_transform(target)
 
-
-def read_data_HAR(dataset, num_sample):
-    X_train = load_file(os.path.join(dataset, 'train/X_train.txt'))
-    print(X_train.shape)
-    y_train = load_file(os.path.join(dataset, 'train/y_train.txt'))
-    subject_train = load_file(os.path.join(dataset, 'train/subject_train.txt'))
-    X_test = load_file(os.path.join(dataset, 'test/X_test.txt'))
-    y_test = load_file(os.path.join(dataset, 'test/y_test.txt'))
-    subject_test = load_file(os.path.join(dataset, 'test/subject_test.txt'))
-    x = np.concatenate((X_train, X_test), axis=0)
-    y = np.concatenate((y_train, y_test), axis=0).squeeze()-1
-    subject = np.concatenate([subject_train, subject_test], axis=0).squeeze()
-    user_group_train = {}
-    user_group_test = {}
-    for i in range(30):
-        idxs = np.where(subject==(i+1))[0]
-        np.random.shuffle(idxs)
-        #idxs = idxs[0:num_sample]
-        train_idxs = idxs[:num_sample]
-        test_idxs = idxs[num_sample:]
-        user_group_train[i] = train_idxs
-        user_group_test[i] = test_idxs
-    return x, y, user_group_train, x, y, user_group_test
+        return img, target
 
 
-def read_data_HAD(data_path, num_sample):
-    user_group_train = {}
-    user_group_test = {}
-    x = np.load(os.path.join(data_path, 'X_new.npy'), allow_pickle=True)
-    y = np.load(os.path.join(data_path, 'Y.npy'), allow_pickle=True)
-    subject = np.load(os.path.join(data_path, 'Subject.npy'), allow_pickle=True)
-    for i in range(14):
-        idxs = np.where(subject==(i))[0]
-        np.random.shuffle(idxs)
-        #idxs = idxs[0:num_sample]
-        num_sample = len(idxs)
-        train_idxs = idxs[:round(num_sample*0.8)]
-        test_idxs = idxs[round(num_sample*0.8):]
-        user_group_train[i] = train_idxs
-        user_group_test[i] = test_idxs
-    return x, y, user_group_train, x, y, user_group_test
-
-
-class HADDataset(Dataset):
-    def __init__(self, data_x, data_y, transform = None):
-        self.data = torch.from_numpy(data_x).float()
-        self.targets = torch.LongTensor(data_y)
-        self.transform = transform
-
-    def __getitem__(self,  index):
-        feature = self.data[index]
-        if(self.transform is not None):
-            feature = self.transform(feature)
-        label = self.targets[index]
-        return feature, label
-
-    def __len__(self):
-        return len(self.targets)
+    def __len__(self) -> int:
+        return len(self.data)

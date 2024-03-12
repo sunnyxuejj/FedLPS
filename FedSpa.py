@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # @python: 3.8
+import copy
 import os
 
 import pickle
@@ -9,52 +10,154 @@ from agg.avg import *
 from Text import DatasetLM
 from utils.options import args_parser
 from util import get_dataset_mnist_extr_noniid, get_dataset_cifar10_extr_noniid, get_dataset_cifar100_extr_noniid, \
-    get_dataset_tiny_extr_noniid, train_val_test_image, repackage_hidden
+    get_dataset_tiny_extr_noniid, train_val_test_image
 from utils.main_flops_counter import count_training_flops
-from Models import all_models
-from data.reddit.user_data import data_process
-import warnings
+from util import repackage_hidden
+from Models import all_models, needs_mask
 from Client import Client, evaluate
 from FedAvg import make_capacity
+from data.reddit.user_data import data_process
+import warnings
 
 warnings.filterwarnings('ignore')
 
 args = args_parser()
-FLOPS_capacity = [46528.0, 93056.0, 186112.0, 372224.0, 744448.0]
 
 
-class Client_Rep(Client):
+def make_mask(model):
+    mask_layers_name = model.mask_weight_indicator
+    mask = [None] * len(mask_layers_name)
+    step = 0
+    for name, param in model.named_parameters():
+        if name in mask_layers_name:
+            tensor = param.data.cpu().numpy()
+            mask[step] = np.ones_like(tensor)
+            step = step + 1
+    return mask
 
-    def update_weights_rep(self, weights, round, lr=None):
+
+def mask_model(model, mask):
+    step = 0
+    for name, param in model.named_parameters():
+        if name in model.mask_weight_indicator:
+            weight_dev = param.device
+            param.data = torch.from_numpy(mask[step] * param.data.cpu().numpy()).to(weight_dev)
+            step = step + 1
+
+
+def prune_by_layer(test_model, args, masks, sparsity=0.4, sparsity_distribution='erk'):
+    step = 0
+    weights_by_layer = test_model._weights_by_layer(sparsity=sparsity,
+                                                    sparsity_distribution=sparsity_distribution)
+    mask_half = []
+    for name, param in test_model.named_parameters():
+        # We need to figure out how many to prune
+        n_total = 0
+        if needs_mask(name, args.mask_weight_indicator):
+            n_total += param.numel()
+            n_prune = int(n_total - weights_by_layer[name])
+            if n_prune >= n_total or n_prune < 0:
+                continue
+                # Determine smallest indices
+            if not torch.where(param == 1.0, True, False).all():
+                _, prune_indices = torch.topk(torch.abs(param.data.flatten()),
+                                              n_prune, largest=False)
+            else:
+                prune_indices = torch.tensor(list(range(param.shape[0])[-n_prune:]))
+
+            # Write mask
+            param.data.view(param.data.numel())[prune_indices] = 0
+            _mask = torch.from_numpy(masks[step])
+            _mask.view(_mask.numel())[prune_indices] = 0
+            mask_half.append(_mask.cpu().numpy())
+            step += 1
+    return mask_half
+
+
+class Client_FedSpa(Client):
+    def __init__(self, *args, **kwargs):
+        super(Client_FedSpa, self).__init__(*args, **kwargs)
+        self.mask = make_mask(copy.deepcopy(self.local_net))
+
+    def prune_by_dst(self, round, sparsity=0.4, sparsity_distribution='erk'):
+        test_model = copy.deepcopy(self.local_net)
+        optimizer = torch.optim.SGD(test_model.parameters(),
+                                    lr=self.args.lr * (self.args.lr_decay ** round),
+                                    momentum=self.args.momentum, weight_decay=self.args.wdecay)
+        test_model.train()
+        for batch_ind, local_data in enumerate(self.traindata_loader):
+            optimizer.zero_grad()
+
+            if self.args.dataset == 'reddit':
+                x = torch.stack(local_data[:-1]).to(self.device)
+                y = torch.stack(local_data[1:]).view(-1).to(self.device)
+                hidden = test_model.init_hidden(self.args.local_bs)
+                hidden = repackage_hidden(hidden)
+                if hidden[0][0].size(1) != x.size(1):
+                    hidden = test_model.init_hidden(x.size(1))
+                out, hidden = test_model(x, hidden)
+            else:
+                x, y = local_data[0].to(self.device), local_data[1].to(self.device)
+                out = test_model(x)
+            self.loss_func(out, y).backward()
+
+            mask_half = prune_by_layer(test_model, args, copy.deepcopy(self.mask), sparsity, sparsity_distribution)
+
+            weights_by_layer = test_model._weights_by_layer(sparsity=0.5,
+                                                            sparsity_distribution=sparsity_distribution)
+            step = 0
+            for name, param in test_model.named_parameters():
+                if not needs_mask(name, test_model.mask_weight_indicator):
+                    continue
+                # We need to figure out how many to grow
+                _mask = torch.from_numpy(mask_half[step])
+                n_nonzero = (_mask != 0).float().sum()
+                n_grow = int(weights_by_layer[name] - n_nonzero)
+                if n_grow < 0:
+                    continue
+                # print('grow from', n_nonzero, 'to', weights_by_layer[name])
+
+                _, grow_indices = torch.topk(torch.abs(param.grad.flatten()),
+                                             n_grow, largest=True)
+
+                # Write and apply mask
+                param.data.view(param.data.numel())[grow_indices] = 0
+                _mask = torch.from_numpy(mask_half[step])
+                _mask.view(_mask.numel())[grow_indices] = 1
+                self.mask[step] = _mask.cpu().numpy()
+                step += 1
+            break
+
+        step = 0
+        for name, param in self.local_net.named_parameters():
+
+            # We do not prune bias term
+            if name in self.local_net.mask_weight_indicator:
+                weight_dev = param.device
+                param.data = param.data * torch.from_numpy(self.mask[step]).to(weight_dev)
+                step += 1
+
+    def train(self, w_server, round, lr=None):
         '''Train the client network for a single round.'''
-
+        EPS = 1e-9
         epoch_losses, epoch_acc = [], []
         if lr:
             self.learning_rate = lr
-        for key in self.args.personal_layers:
-            weights[key] = copy.deepcopy(self.local_net.state_dict()[key])
-        self.local_net.load_state_dict(copy.deepcopy(weights))
+        a = self.local_net.state_dict()
+        self.local_net.load_state_dict(copy.deepcopy(w_server))
         self.local_net = self.local_net.to(self.device)
-        dl_cost = 0
-        for key in weights:
-            if key not in self.args.personal_layers:
-                dl_cost += torch.numel(weights[key]) * 32
+        dl_cost = self.local_net.stat_param_sizes()
+        val_res = evaluate(self.args, self.valdata_loader, copy.deepcopy(self.local_net), self.device)
+        acc_beforeTrain = val_res[1]
+        if acc_beforeTrain > self.args.prune_start_acc:
+            self.mask = prune_by_layer(self.local_net, args, self.mask, self.args.sparsity)
+            self.prune_by_dst(round)
+
         self.local_net.train()
+
         self.reset_optimizer(round=round)
 
-        for iter in range(self.args.client_all_epoch):
-            if iter < self.args.personal_epoch:
-                for name, param in self.local_net.named_parameters():
-                    if name in self.args.personal_layers:
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-            else:
-                for name, param in self.local_net.named_parameters():
-                    if name in self.args.personal_layers:
-                        param.requires_grad = False
-                    else:
-                        param.requires_grad = True
+        for iter in range(self.args.local_ep):
             list_loss = []
             total, corrent = 0, 0
             for batch_ind, local_data in enumerate(self.traindata_loader):
@@ -78,6 +181,12 @@ class Client_Rep(Client):
                 loss.backward()
                 if self.args.clip:
                     torch.nn.utils.clip_grad_norm_(self.local_net.parameters(), self.args.clip)
+                for name, p in self.local_net.named_parameters():
+                    if name in self.local_net.mask_weight_indicator:
+                        tensor = p.data.cpu().numpy()
+                        grad_tensor = p.grad.data.cpu().numpy()
+                        grad_tensor = np.where(abs(tensor) < EPS, 0, grad_tensor)
+                        p.grad.data = torch.from_numpy(grad_tensor).to(device)
 
                 self.optimizer.step()
                 list_loss.append(loss.item())
@@ -90,14 +199,23 @@ class Client_Rep(Client):
             epoch_losses.append(sum(list_loss) / len(list_loss))
 
         self.learning_rate = self.optimizer.param_groups[0]["lr"]
+        ul_cost = self.local_net.stat_param_sizes()
         cur_params = copy.deepcopy(self.local_net.state_dict())
-        ul_cost, grad = 0, {}
-        for key in cur_params:
-            if key not in self.args.personal_layers:
-                grad[key] = cur_params[key] - weights[key]
-                ul_cost += torch.numel(cur_params[key]) * 32
-        train_flops = len(self.traindata_loader) * count_training_flops(self.local_net,
-                                                                        self.args) * self.args.client_all_epoch
+        train_flops = len(self.traindata_loader) * count_training_flops(copy.deepcopy(self.local_net),
+                                                                        self.args, full=False) * self.args.local_ep
+
+        grad = {}
+        step = 0
+        for k in cur_params:
+            if k in self.local_net.mask_weight_indicator:
+                cur_params[k] = cur_params[k] * torch.from_numpy(self.mask[step]).to(self.device)
+                w_server[k] = w_server[k] * torch.from_numpy(self.mask[step]).to(self.device)
+                step += 1
+            grad[k] = cur_params[k] - w_server[k]
+
+        # if acc_beforeTrain > self.args.prune_start_acc:
+        # self.mask = prune_by_layer(self.local_net, args, self.mask, self.args.sparsity)
+        # self.prune_by_dst(round)
 
         ret = dict(state=grad,
                    loss=sum(epoch_losses) / len(epoch_losses),
@@ -109,8 +227,6 @@ class Client_Rep(Client):
 
 if __name__ == "__main__":
     config = args
-    config.client_all_epoch = 7
-    config.personal_epoch = 2
 
     torch.cuda.set_device(args.gpu)
     torch.manual_seed(args.seed)
@@ -196,11 +312,12 @@ if __name__ == "__main__":
             idx_vals.append(idx_val)
             data_num[i] = len(dataset_train[i])
 
-    best_val_acc = None
+    best_val_loss = None
     os.makedirs(f'./log/{args.dataset}/', exist_ok=True)
-    model_saved = './log/{}/model_FedRep_{}.pt'.format(args.dataset, args.seed)
+    model_saved = './log/{}/model_FedSpa_{}.pt'.format(args.dataset, args.seed)
+    config.personal_layers = []
 
-    # 确定哪些层个性化
+    # 确定哪些层可以被mask
     config.mask_weight_indicator = []
     config.personal_layers = []
     model_indicator = all_models[args.dataset](config, device)
@@ -213,30 +330,28 @@ if __name__ == "__main__":
     first_layer = layers_name[0]
     last_layer = layers_name[-1]
     model_indicator.to(device)
-    personal_layers = []
-    personal_layers.append(layers[-4])
-    personal_layers.append(layers[-3])
-    personal_layers.append(layers[-2])
-    personal_layers.append(layers[-1])
-    config.personal_layers = personal_layers
+    model_indicator.label_mask_weight()
+    mask_weight_indicator = model_indicator.mask_weight_indicator
+    if last_layer in mask_weight_indicator:
+        mask_weight_indicator = mask_weight_indicator[:-1]
+    config.mask_weight_indicator = copy.deepcopy(mask_weight_indicator)
 
     # initialized global model
     net_glob = all_models[args.dataset](config, device)
     net_glob = net_glob.to(device)
     w_glob = net_glob.state_dict()
-    for key in config.personal_layers:
-        del w_glob[key]
     # initialize clients
     clients = {}
     client_ids = []
+    FLOPS_capacity = [46528.0, 93056.0, 186112.0, 372224.0, 744448.0]
     config.proportion = [1, 1, 1, 1, 1]
     rate_idx = torch.multinomial(torch.tensor(config.proportion).float(), num_samples=config.nusers,
                                  replacement=True).tolist()
     client_capacity = np.array(FLOPS_capacity)[rate_idx]
     for client_id in range(args.nusers):
-        cl = Client_Rep(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
-                        dataset_test[client_id],
-                        local_net=all_models[args.dataset](config, device))
+        cl = Client_FedSpa(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
+                           dataset_test[client_id],
+                           local_net=all_models[args.dataset](config, device))
         clients[client_id] = cl
         client_ids.append(client_id)
         torch.cuda.empty_cache()
@@ -248,16 +363,18 @@ if __name__ == "__main__":
         compute_flops_round, training_time = [], []
 
         net_glob.train()
-        w_locals, loss_locals, avg_weight, acc_locals = [], [], [], []
+        w_locals, mask_locals, loss_locals, acc_locals = [], [], [], []
         m = max(int(args.frac * len(clients)), 1)
         idxs_users = np.random.choice(len(clients), m, replace=False)  # 随机采样client
         total_num = 0
         for idx in idxs_users:
             client = clients[idx]
             i = client_ids.index(idx)
-            avg_weight.append(data_num[idx])
-            train_result = client.update_weights_rep(copy.deepcopy(w_glob), round)
+            train_model = copy.deepcopy(net_glob)
+            mask_model(train_model, client.mask)
+            train_result = client.train(w_server=copy.deepcopy(train_model.state_dict()), round=round)
             w_locals.append(train_result['state'])
+            mask_locals.append(client.mask)
             loss_locals.append(train_result['loss'])
             acc_locals.append(train_result['acc'])
 
@@ -268,27 +385,27 @@ if __name__ == "__main__":
             compute_flops_round.append(train_result['train_flops'])
             training_time.append(train_result['train_flops'] / 1e6 / client_capacity[idx])
 
-        w_glob = avg(w_locals, w_glob, args, device)
+        # global_weights_epoch = average_weights_with_masks(w_locals, mask_locals, config)
+        # w_glob = mix_global_weights(w_glob, global_weights_epoch, mask_locals, config)
+        w_glob = avg(w_locals, w_glob, config, device)
+        net_glob.load_state_dict(w_glob)
+        net_glob = net_glob.to(device)
 
         train_loss, train_acc = [], []
-        val_loss, val_acc = [], []
-        test_loss, test_acc = [], []
-
-        local_model = copy.deepcopy(net_glob)
-        local_params = copy.deepcopy(w_glob)
+        per_val_loss, per_val_acc = [], []
+        glob_test_loss, glob_test_acc = [], []
         for _, c in clients.items():
-            for key in config.personal_layers:
-                local_params[key] = c.local_net.state_dict()[key]
-            local_model.load_state_dict(local_params)
-            train_res = evaluate(config, c.traindata_loader, local_model, device)
+            local_mask_model = copy.deepcopy(net_glob)
+            mask_model(local_mask_model, c.mask)
+            train_res = evaluate(config, c.traindata_loader, copy.deepcopy(local_mask_model), device)
             train_loss.append(train_res[0])
             train_acc.append(train_res[1])
-            val_res = evaluate(config, c.valdata_loader, local_model, device)
-            val_loss.append(val_res[0])
-            val_acc.append(val_res[1])
-            test_res = evaluate(config, c.testdata_loader, local_model, device)
-            test_loss.append(test_res[0])
-            test_acc.append(test_res[1])
+            per_val_res = evaluate(config, c.valdata_loader, copy.deepcopy(local_mask_model), device)
+            per_val_loss.append(per_val_res[0])
+            per_val_acc.append(per_val_res[1])
+            glob_test_res = evaluate(config, c.testdata_loader, copy.deepcopy(local_mask_model), device)
+            glob_test_loss.append(glob_test_res[0])
+            glob_test_acc.append(glob_test_res[1])
         print('\nRound {}, Train loss: {:.5f}, train accuracy: {:.5f}'.format(round, sum(train_loss) / len(train_loss),
                                                                               sum(train_acc) / len(train_acc)),
               flush=True)
@@ -299,8 +416,7 @@ if __name__ == "__main__":
         print('Max local training time: {:.5f} s'.format(max(training_time)))
 
         print("Validation loss: {:.5f}, "
-              "val accuracy: {:.5f}".format(sum(val_loss) / len(val_loss),
-                                            sum(val_acc) / len(val_acc)))
-        print("test loss: {:.5f}, "
-              "test accuracy: {:.5f}".format(sum(test_loss) / len(test_loss),
-                                             sum(test_acc) / len(test_acc)), flush=True)
+              "val accuracy: {:.5f}".format(sum(per_val_loss) / len(per_val_loss),
+                                            sum(per_val_acc) / len(per_val_acc)), flush=True)
+        print("test loss: {:.5f}, test accuracy: {:.5f}".format(sum(glob_test_loss) / len(glob_test_loss),
+                                                                sum(glob_test_acc) / len(glob_test_acc)), flush=True)

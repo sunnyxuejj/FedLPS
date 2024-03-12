@@ -529,9 +529,24 @@ class VGG(CommenNet):
     def __init__(self, vgg_name, *args, **kwargs):
         super(VGG, self).__init__(*args, **kwargs)
         self.features = self._make_layers(cfg[vgg_name])
-        self.classifier = nn.Linear(512, 10)
+        if self.args.dataset == 'cifar100':
+            self.classifier = nn.Linear(512, 100)
+        elif self.args.dataset == 'tinyimagenet':
+            self.classifier = nn.Linear(2048, 200)
+        elif self.args.dataset == 'cifar10':
+            self.classifier = nn.Linear(512, 10)
 
         self.init_param_sizes()
+        self.adapted_model_para = {name: None for name, val in self.named_parameters()}
+
+    def set_adapted_para(self, name, val):
+        self.adapted_model_para[name] = val
+
+    def del_adapted_para(self):
+        for key, val in self.adapted_model_para.items():
+            if self.adapted_model_para[key] is not None:
+                self.adapted_model_para[key].grad = None
+                self.adapted_model_para[key] = None
 
     def forward(self, x):
         out = self.features(x)
@@ -585,5 +600,7 @@ def VGG19(args, device, mask_rate=1):
 all_models = {
     'mnist': MNISTNet,
     'cifar10': VGG11,
-    'reddit': RNNModel
+    'cifar100': VGG13,
+    'tinyimagenet': VGG16,
+    'reddit': RNNModel,
 }

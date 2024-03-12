@@ -3,19 +3,22 @@
 # @python: 3.8
 import os
 
+import torch.nn as nn
 import pickle
 
+from torch.utils.data import DataLoader
 from agg.avg import *
 from Text import DatasetLM
 from utils.options import args_parser
 from util import get_dataset_mnist_extr_noniid, get_dataset_cifar10_extr_noniid, get_dataset_cifar100_extr_noniid, \
     get_dataset_tiny_extr_noniid, train_val_test_image, repackage_hidden
 from utils.main_flops_counter import count_training_flops
+from dataset import DatasetSplit
 from Models import all_models
 from data.reddit.user_data import data_process
-import warnings
 from Client import Client, evaluate
 from FedAvg import make_capacity
+import warnings
 
 warnings.filterwarnings('ignore')
 
@@ -23,38 +26,52 @@ args = args_parser()
 FLOPS_capacity = [46528.0, 93056.0, 186112.0, 372224.0, 744448.0]
 
 
-class Client_Rep(Client):
+def mask(net_glob, mask_rate):
+    mask = {}
+    percentile_values ={}
+    for name, param in net_glob.named_parameters():
+        if name in config.mask_weight_indicator:
+            tensor = copy.deepcopy(param.data)
+            percentile_value = np.percentile(abs(tensor.cpu().numpy()), mask_rate * 100)
+            percentile_values[name] = percentile_value
+            m = nn.Threshold(percentile_value, 0)
+            param.data = torch.sign(param.data) * m(torch.abs(param.data))
+            mask[name] = copy.deepcopy(param.data).bool()
+    return net_glob, mask, percentile_values
 
-    def update_weights_rep(self, weights, round, lr=None):
+
+def prune(params, mask_rate):
+    for name, param in params.items():
+        if name in config.mask_weight_indicator:
+            tensor = copy.deepcopy(param)
+            percentile_value = np.percentile(abs(tensor.cpu().numpy()), mask_rate * 100)
+            mask = torch.where(abs(tensor) < percentile_value, 0, 1)
+            param *= mask
+    return params
+
+
+class Client_CS(Client):
+    def __init__(self, *args, **kwargs):
+        super(Client_CS, self).__init__(*args, **kwargs)
+
+    def update_weights_CS(self, w_server, round, lr=None):
         '''Train the client network for a single round.'''
 
         epoch_losses, epoch_acc = [], []
+
         if lr:
             self.learning_rate = lr
-        for key in self.args.personal_layers:
-            weights[key] = copy.deepcopy(self.local_net.state_dict()[key])
-        self.local_net.load_state_dict(copy.deepcopy(weights))
+        global_weight_collector = []
+        for name in w_server:
+            global_weight_collector.append(copy.deepcopy(w_server[name]).to(self.args.device))
+        self.local_net.load_state_dict(copy.deepcopy(w_server))
         self.local_net = self.local_net.to(self.device)
-        dl_cost = 0
-        for key in weights:
-            if key not in self.args.personal_layers:
-                dl_cost += torch.numel(weights[key]) * 32
+        train_flops = len(self.traindata_loader) * count_training_flops(copy.deepcopy(self.local_net), self.args) * self.args.local_ep
+        dl_cost = self.local_net.stat_param_sizes()
         self.local_net.train()
         self.reset_optimizer(round=round)
 
-        for iter in range(self.args.client_all_epoch):
-            if iter < self.args.personal_epoch:
-                for name, param in self.local_net.named_parameters():
-                    if name in self.args.personal_layers:
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-            else:
-                for name, param in self.local_net.named_parameters():
-                    if name in self.args.personal_layers:
-                        param.requires_grad = False
-                    else:
-                        param.requires_grad = True
+        for iter in range(self.local_epochs):
             list_loss = []
             total, corrent = 0, 0
             for batch_ind, local_data in enumerate(self.traindata_loader):
@@ -91,13 +108,15 @@ class Client_Rep(Client):
 
         self.learning_rate = self.optimizer.param_groups[0]["lr"]
         cur_params = copy.deepcopy(self.local_net.state_dict())
-        ul_cost, grad = 0, {}
-        for key in cur_params:
-            if key not in self.args.personal_layers:
-                grad[key] = cur_params[key] - weights[key]
-                ul_cost += torch.numel(cur_params[key]) * 32
-        train_flops = len(self.traindata_loader) * count_training_flops(self.local_net,
-                                                                        self.args) * self.args.client_all_epoch
+
+        grad = {}
+        for k in cur_params:
+            grad[k] = cur_params[k] - w_server[k]
+        if round > 0:
+            grad = prune(grad, config.mask_rate)
+        ul_cost = 0
+        for name in grad:
+            ul_cost += (grad[name] != 0).float().sum() * 32
 
         ret = dict(state=grad,
                    loss=sum(epoch_losses) / len(epoch_losses),
@@ -109,8 +128,7 @@ class Client_Rep(Client):
 
 if __name__ == "__main__":
     config = args
-    config.client_all_epoch = 7
-    config.personal_epoch = 2
+    config.mask = True
 
     torch.cuda.set_device(args.gpu)
     torch.manual_seed(args.seed)
@@ -169,8 +187,8 @@ if __name__ == "__main__":
             data_num[i] = len(dataset_train[i])
     elif args.dataset == 'reddit':
         # dataload
-        data_dir = 'data/reddit/train/'
-        with open('data/reddit/reddit_vocab.pck', 'rb') as f:
+        data_dir = './data/reddit/train/'
+        with open('./data/reddit/reddit_vocab.pck', 'rb') as f:
             vocab = pickle.load(f)
         nvocab = vocab['size']
         config.nvocab = nvocab
@@ -198,12 +216,12 @@ if __name__ == "__main__":
 
     best_val_acc = None
     os.makedirs(f'./log/{args.dataset}/', exist_ok=True)
-    model_saved = './log/{}/model_FedRep_{}.pt'.format(args.dataset, args.seed)
+    model_saved = './log/{}/model_CS_{}.pt'.format(args.dataset, args.seed)
 
-    # 确定哪些层个性化
+    # 确定哪些层可以被mask
     config.mask_weight_indicator = []
     config.personal_layers = []
-    model_indicator = all_models[args.dataset](config, device)
+    model_indicator = all_models[config.dataset](config, device)
     model_weight = copy.deepcopy(model_indicator.state_dict())
     layers = list(model_weight.keys())
     layers_name = []
@@ -213,19 +231,18 @@ if __name__ == "__main__":
     first_layer = layers_name[0]
     last_layer = layers_name[-1]
     model_indicator.to(device)
-    personal_layers = []
-    personal_layers.append(layers[-4])
-    personal_layers.append(layers[-3])
-    personal_layers.append(layers[-2])
-    personal_layers.append(layers[-1])
-    config.personal_layers = personal_layers
+    model_indicator.label_mask_weight()
+    mask_weight_indicator = model_indicator.mask_weight_indicator
+    # if first_layer in mask_weight_indicator:
+    #     mask_weight_indicator = mask_weight_indicator[1:]
+    if last_layer in mask_weight_indicator:
+        mask_weight_indicator = mask_weight_indicator[:-1]
+    config.mask_weight_indicator = copy.deepcopy(mask_weight_indicator)
 
     # initialized global model
     net_glob = all_models[args.dataset](config, device)
     net_glob = net_glob.to(device)
     w_glob = net_glob.state_dict()
-    for key in config.personal_layers:
-        del w_glob[key]
     # initialize clients
     clients = {}
     client_ids = []
@@ -234,9 +251,9 @@ if __name__ == "__main__":
                                  replacement=True).tolist()
     client_capacity = np.array(FLOPS_capacity)[rate_idx]
     for client_id in range(args.nusers):
-        cl = Client_Rep(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
-                        dataset_test[client_id],
-                        local_net=all_models[args.dataset](config, device))
+        cl = Client_CS(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
+                       dataset_test[client_id],
+                       local_net=all_models[args.dataset](config, device))
         clients[client_id] = cl
         client_ids.append(client_id)
         torch.cuda.empty_cache()
@@ -246,18 +263,21 @@ if __name__ == "__main__":
         upload_cost_round, uptime = [], []
         download_cost_round, down_time = [], []
         compute_flops_round, training_time = [], []
+        if round > 0:
+            net_glob, mask_global, percentile_values = mask(net_glob, config.mask_rate)
+            w_glob = net_glob.state_dict()
 
         net_glob.train()
-        w_locals, loss_locals, avg_weight, acc_locals = [], [], [], []
+        w_locals, avg_weight, loss_locals, acc_locals = [], [], [], []
         m = max(int(args.frac * len(clients)), 1)
         idxs_users = np.random.choice(len(clients), m, replace=False)  # 随机采样client
         total_num = 0
         for idx in idxs_users:
             client = clients[idx]
             i = client_ids.index(idx)
-            avg_weight.append(data_num[idx])
-            train_result = client.update_weights_rep(copy.deepcopy(w_glob), round)
+            train_result = client.update_weights_CS(w_server=copy.deepcopy(w_glob), round=round)
             w_locals.append(train_result['state'])
+            avg_weight.append(data_num[idx])
             loss_locals.append(train_result['loss'])
             acc_locals.append(train_result['acc'])
 
@@ -268,30 +288,24 @@ if __name__ == "__main__":
             compute_flops_round.append(train_result['train_flops'])
             training_time.append(train_result['train_flops'] / 1e6 / client_capacity[idx])
 
-        w_glob = avg(w_locals, w_glob, args, device)
+        w_glob = avg(w_locals, w_glob, config, device)
+        net_glob.load_state_dict(w_glob)
 
         train_loss, train_acc = [], []
         val_loss, val_acc = [], []
-        test_loss, test_acc = [], []
-
-        local_model = copy.deepcopy(net_glob)
-        local_params = copy.deepcopy(w_glob)
+        per_test_loss, per_test_acc = [], []
         for _, c in clients.items():
-            for key in config.personal_layers:
-                local_params[key] = c.local_net.state_dict()[key]
-            local_model.load_state_dict(local_params)
-            train_res = evaluate(config, c.traindata_loader, local_model, device)
-            train_loss.append(train_res[0])
-            train_acc.append(train_res[1])
-            val_res = evaluate(config, c.valdata_loader, local_model, device)
-            val_loss.append(val_res[0])
-            val_acc.append(val_res[1])
-            test_res = evaluate(config, c.testdata_loader, local_model, device)
-            test_loss.append(test_res[0])
-            test_acc.append(test_res[1])
+            per_train_res = evaluate(config, c.traindata_loader, net_glob, device)
+            train_loss.append(per_train_res[0])
+            train_acc.append(per_train_res[1])
+            per_val_res = evaluate(config, c.valdata_loader, net_glob, device)
+            val_loss.append(per_val_res[0])
+            val_acc.append(per_val_res[1])
+            per_test_res = evaluate(config, c.testdata_loader, net_glob, device)
+            per_test_loss.append(per_test_res[0])
+            per_test_acc.append(per_test_res[1])
         print('\nRound {}, Train loss: {:.5f}, train accuracy: {:.5f}'.format(round, sum(train_loss) / len(train_loss),
-                                                                              sum(train_acc) / len(train_acc)),
-              flush=True)
+                                                                    sum(train_acc) / len(train_acc)), flush=True)
         print('Max upload cost: {:.3f} MB, Max download cost: {:.3f} '
               'MB'.format(max(upload_cost_round) / 8 / 1024 / 1024, max(download_cost_round) / 8 / 1024 / 1024))
         print('Sum compute flops cost: {:.3f} MB'.format(sum(compute_flops_round) / 1e6))
@@ -302,5 +316,5 @@ if __name__ == "__main__":
               "val accuracy: {:.5f}".format(sum(val_loss) / len(val_loss),
                                             sum(val_acc) / len(val_acc)))
         print("test loss: {:.5f}, "
-              "test accuracy: {:.5f}".format(sum(test_loss) / len(test_loss),
-                                             sum(test_acc) / len(test_acc)), flush=True)
+              "test accuracy: {:.5f}".format(sum(per_test_loss) / len(per_test_loss),
+                                             sum(per_test_acc) / len(per_test_acc)), flush=True)

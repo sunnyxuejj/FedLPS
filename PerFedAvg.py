@@ -4,7 +4,6 @@
 import os
 
 import pickle
-
 from agg.avg import *
 from Text import DatasetLM
 from utils.options import args_parser
@@ -23,67 +22,84 @@ args = args_parser()
 FLOPS_capacity = [46528.0, 93056.0, 186112.0, 372224.0, 744448.0]
 
 
-class Client_Rep(Client):
+class Client_PerFedAvg(Client):
 
-    def update_weights_rep(self, weights, round, lr=None):
+    def update_weights_perFedavg(self, weights, round, lr=None):
         '''Train the client network for a single round.'''
 
         epoch_losses, epoch_acc = [], []
         if lr:
             self.learning_rate = lr
-        for key in self.args.personal_layers:
-            weights[key] = copy.deepcopy(self.local_net.state_dict()[key])
+        lr_in = self.learning_rate * 0.001
         self.local_net.load_state_dict(copy.deepcopy(weights))
         self.local_net = self.local_net.to(self.device)
+        if self.args.dataset == 'reddit':
+            hidden = self.local_net.init_hidden(self.args.local_bs)
+            hidden_tar = self.local_net.init_hidden(self.args.local_bs)
         dl_cost = 0
         for key in weights:
-            if key not in self.args.personal_layers:
-                dl_cost += torch.numel(weights[key]) * 32
+            dl_cost += torch.numel(weights[key]) * 32
         self.local_net.train()
         self.reset_optimizer(round=round)
 
-        for iter in range(self.args.client_all_epoch):
-            if iter < self.args.personal_epoch:
-                for name, param in self.local_net.named_parameters():
-                    if name in self.args.personal_layers:
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-            else:
-                for name, param in self.local_net.named_parameters():
-                    if name in self.args.personal_layers:
-                        param.requires_grad = False
-                    else:
-                        param.requires_grad = True
+        for iter in range(self.args.local_ep):
             list_loss = []
             total, corrent = 0, 0
             for batch_ind, local_data in enumerate(self.traindata_loader):
-                self.optimizer.zero_grad()
+                param_dict = dict()
+                for name, param in self.local_net.named_parameters():
+                    if param.requires_grad:
+                        param_dict[name] = param.to(device=self.device)
+                names_weights_copy = param_dict
+                self.local_net.zero_grad()
 
                 if self.args.dataset == 'reddit':
                     x = torch.stack(local_data[:-1]).to(self.device)
                     y = torch.stack(local_data[1:]).view(-1).to(self.device)
+                    tar_x = torch.stack(local_data[:-1]).to(self.device)
+                    tar_y = torch.stack(local_data[1:]).view(-1).to(self.device)
                     total += y.size(0)
-                    hidden = self.local_net.init_hidden(self.args.local_bs)
                     hidden = repackage_hidden(hidden)
                     if hidden[0][0].size(1) != x.size(1):
                         hidden = self.local_net.init_hidden(x.size(1))
                     out, hidden = self.local_net(x, hidden)
                 else:
                     x, y = local_data[0].to(self.device), local_data[1].to(self.device)
+                    tar_x, tar_y = local_data[0].to(self.device), local_data[1].to(self.device)
                     total += len(y)
                     out = self.local_net(x)
 
-                loss = self.loss_func(out, y)
-                loss.backward()
-                if self.args.clip:
-                    torch.nn.utils.clip_grad_norm_(self.local_net.parameters(), self.args.clip)
-
-                self.optimizer.step()
-                list_loss.append(loss.item())
+                loss_sup = self.loss_func(out, y)
+                list_loss.append(loss_sup.item())
                 _, pred_labels = torch.max(out, 1)
                 pred_labels = pred_labels.view(-1)
                 corrent += torch.sum(torch.eq(pred_labels, y)).item()
+
+                grads = torch.autograd.grad(loss_sup, names_weights_copy.values(), create_graph=True, allow_unused=True)
+                names_grads_copy = dict(zip(names_weights_copy.keys(), grads))
+                for key, grad in names_grads_copy.items():
+                    if grad is not None:
+                        names_grads_copy[key] = names_grads_copy[key].sum(dim=0)
+                        names_weights_copy[key] = names_weights_copy[key] - lr_in * names_grads_copy[key]
+
+                if self.args.dataset == 'reddit':
+                    if hidden_tar[0][0].size(1) != tar_x.size(1):
+                        hidden_tar = self.local_net.init_hidden(x.size(1))
+                        hidden_tar = repackage_hidden(hidden_tar)
+                    tar_out, hidden_tar = self.local_net(tar_x, hidden_tar)
+                else:
+                    tar_out = self.local_net(tar_x)
+                    loss_tar = self.loss_func(tar_out, tar_y)
+                    loss_tar.backward()
+                if self.args.clip:
+                    torch.nn.utils.clip_grad_norm_(self.local_net.parameters(), self.args.clip)
+                self.optimizer.step()
+
+                del tar_out.grad
+                del loss_sup.grad
+                del out.grad
+                self.optimizer.zero_grad()
+                self.local_net.zero_grad()
 
             acc = corrent / total
             epoch_acc.append(acc)
@@ -91,26 +107,59 @@ class Client_Rep(Client):
 
         self.learning_rate = self.optimizer.param_groups[0]["lr"]
         cur_params = copy.deepcopy(self.local_net.state_dict())
-        ul_cost, grad = 0, {}
-        for key in cur_params:
-            if key not in self.args.personal_layers:
-                grad[key] = cur_params[key] - weights[key]
-                ul_cost += torch.numel(cur_params[key]) * 32
-        train_flops = len(self.traindata_loader) * count_training_flops(self.local_net,
-                                                                        self.args) * self.args.client_all_epoch
+        ul_cost = 0
+        for key in weights:
+            ul_cost += torch.numel(weights[key]) * 32
+        train_flops = 2 * len(self.traindata_loader) * count_training_flops(self.local_net,
+                                                                            self.args) * self.args.local_ep
 
-        ret = dict(state=grad,
+        ret = dict(state=cur_params,
                    loss=sum(epoch_losses) / len(epoch_losses),
                    acc=sum(epoch_acc) / len(epoch_acc),
                    dl_cost=dl_cost, ul_cost=ul_cost,
                    train_flops=train_flops)
         return ret
 
+    def local_finetune(self, model):
+        '''Train the client network for a single round.'''
+        if self.args.optimizer == 'sgd':
+            optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()),
+                                        lr=self.args.lr,
+                                        momentum=self.args.momentum, weight_decay=self.args.wdecay)
+        elif self.args.optimizer == 'adam':
+            optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
+                                         lr=self.args.lr, weight_decay=self.args.wdecay)
+        if self.args.dataset == 'reddit':
+            hidden = model.init_hidden(self.args.local_bs)
+            hidden = repackage_hidden(hidden)
+        model.train()
+
+        for iter in range(self.args.local_ep):
+            for batch_ind, local_data in enumerate(self.traindata_loader):
+                optimizer.zero_grad()
+
+                if self.args.dataset == 'reddit':
+                    x = torch.stack(local_data[:-1]).to(self.device)
+                    y = torch.stack(local_data[1:]).view(-1).to(self.device)
+                    if hidden[0][0].size(1) != x.size(1):
+                        hidden = model.init_hidden(x.size(1))
+                        hidden = repackage_hidden(hidden)
+                    out, hidden = model(x, hidden)
+                else:
+                    x, y = local_data[0].to(self.device), local_data[1].to(self.device)
+                    out = model(x)
+
+                loss = self.loss_func(out, y)
+                loss.backward()
+                if self.args.clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.clip)
+
+                optimizer.step()
+        return model
+
 
 if __name__ == "__main__":
     config = args
-    config.client_all_epoch = 7
-    config.personal_epoch = 2
 
     torch.cuda.set_device(args.gpu)
     torch.manual_seed(args.seed)
@@ -198,27 +247,11 @@ if __name__ == "__main__":
 
     best_val_acc = None
     os.makedirs(f'./log/{args.dataset}/', exist_ok=True)
-    model_saved = './log/{}/model_FedRep_{}.pt'.format(args.dataset, args.seed)
+    model_saved = './log/{}/model_PFA_{}.pt'.format(args.dataset, args.seed)
 
     # 确定哪些层个性化
     config.mask_weight_indicator = []
     config.personal_layers = []
-    model_indicator = all_models[args.dataset](config, device)
-    model_weight = copy.deepcopy(model_indicator.state_dict())
-    layers = list(model_weight.keys())
-    layers_name = []
-    for key in layers:
-        if 'weight' in key:
-            layers_name.append(key)
-    first_layer = layers_name[0]
-    last_layer = layers_name[-1]
-    model_indicator.to(device)
-    personal_layers = []
-    personal_layers.append(layers[-4])
-    personal_layers.append(layers[-3])
-    personal_layers.append(layers[-2])
-    personal_layers.append(layers[-1])
-    config.personal_layers = personal_layers
 
     # initialized global model
     net_glob = all_models[args.dataset](config, device)
@@ -234,12 +267,18 @@ if __name__ == "__main__":
                                  replacement=True).tolist()
     client_capacity = np.array(FLOPS_capacity)[rate_idx]
     for client_id in range(args.nusers):
-        cl = Client_Rep(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
-                        dataset_test[client_id],
-                        local_net=all_models[args.dataset](config, device))
+        cl = Client_PerFedAvg(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
+                              dataset_test[client_id],
+                              local_net=all_models[args.dataset](config, device))
         clients[client_id] = cl
         client_ids.append(client_id)
         torch.cuda.empty_cache()
+
+    # we need to accumulate compute/DL/UL costs regardless of round number, resetting only
+    # when we actually report these numbers
+    compute_flops = np.zeros(len(clients))  # the total floating operations for each client
+    download_cost = np.zeros(len(clients))
+    upload_cost = np.zeros(len(clients))
 
     for round in range(args.rounds):
         client_capacity = make_capacity(config, client_capacity)
@@ -256,7 +295,7 @@ if __name__ == "__main__":
             client = clients[idx]
             i = client_ids.index(idx)
             avg_weight.append(data_num[idx])
-            train_result = client.update_weights_rep(copy.deepcopy(w_glob), round)
+            train_result = client.update_weights_perFedavg(copy.deepcopy(w_glob), round)
             w_locals.append(train_result['state'])
             loss_locals.append(train_result['loss'])
             acc_locals.append(train_result['acc'])
@@ -268,39 +307,68 @@ if __name__ == "__main__":
             compute_flops_round.append(train_result['train_flops'])
             training_time.append(train_result['train_flops'] / 1e6 / client_capacity[idx])
 
-        w_glob = avg(w_locals, w_glob, args, device)
+        w_glob = average_weights(w_locals, avg_weight, args)
+        net_glob.load_state_dict(w_glob)
 
         train_loss, train_acc = [], []
         val_loss, val_acc = [], []
         test_loss, test_acc = [], []
-
-        local_model = copy.deepcopy(net_glob)
-        local_params = copy.deepcopy(w_glob)
         for _, c in clients.items():
-            for key in config.personal_layers:
-                local_params[key] = c.local_net.state_dict()[key]
-            local_model.load_state_dict(local_params)
-            train_res = evaluate(config, c.traindata_loader, local_model, device)
+            train_res = evaluate(config, c.traindata_loader, net_glob, device)
             train_loss.append(train_res[0])
             train_acc.append(train_res[1])
-            val_res = evaluate(config, c.valdata_loader, local_model, device)
+            val_res = evaluate(config, c.valdata_loader, net_glob, device)
             val_loss.append(val_res[0])
             val_acc.append(val_res[1])
-            test_res = evaluate(config, c.testdata_loader, local_model, device)
+            test_res = evaluate(config, c.testdata_loader, net_glob, device)
             test_loss.append(test_res[0])
             test_acc.append(test_res[1])
-        print('\nRound {}, Train loss: {:.5f}, train accuracy: {:.5f}'.format(round, sum(train_loss) / len(train_loss),
-                                                                              sum(train_acc) / len(train_acc)),
-              flush=True)
+        print('\nTrain loss: {:.5f}, train accuracy: {:.5f}'.format(sum(train_loss) / len(train_loss),
+                                                                    sum(train_acc) / len(train_acc)), flush=True)
         print('Max upload cost: {:.3f} MB, Max download cost: {:.3f} '
               'MB'.format(max(upload_cost_round) / 8 / 1024 / 1024, max(download_cost_round) / 8 / 1024 / 1024))
         print('Sum compute flops cost: {:.3f} MB'.format(sum(compute_flops_round) / 1e6))
         print('Max time for upload time: {:.5f} s, Max time for download: {:.5f} s'.format(max(uptime), max(down_time)))
-        print('Max local training time: {:.5f} s'.format(max(training_time)))
+        print('Max local training time: {:.5f} s'.format(max(training_time)), flush=True)
 
-        print("Validation loss: {:.5f}, "
-              "val accuracy: {:.5f}".format(sum(val_loss) / len(val_loss),
-                                            sum(val_acc) / len(val_acc)))
-        print("test loss: {:.5f}, "
-              "test accuracy: {:.5f}".format(sum(test_loss) / len(test_loss),
-                                             sum(test_acc) / len(test_acc)), flush=True)
+        train_loss, train_acc = [], []
+        val_loss, val_acc = [], []
+        test_loss, test_acc = [], []
+        for _, c in clients.items():
+            train_res = evaluate(config, c.traindata_loader, c.local_net, device)
+            train_loss.append(train_res[0])
+            train_acc.append(train_res[1])
+            val_res = evaluate(config, c.valdata_loader, c.local_net, device)
+            val_loss.append(val_res[0])
+            val_acc.append(val_res[1])
+            test_res = evaluate(config, c.testdata_loader, c.local_net, device)
+            test_loss.append(test_res[0])
+            test_acc.append(test_res[1])
+        print("Validation loss: {:.5f}, val accuracy: {:.5f}".format(sum(val_loss) / len(val_loss),
+                                                                     sum(val_acc) / len(val_acc)))
+        print("test loss: {:.5f}, test accuracy: {:.5f}".format(sum(test_loss) / len(test_loss),
+                                                                sum(test_acc) / len(test_acc)), flush=True)
+
+    train_loss, train_acc = [], []
+    val_loss, val_acc = [], []
+    test_loss, test_acc = [], []
+    for _, c in clients.items():
+        local_model = c.local_finetune(copy.deepcopy(net_glob))
+        train_res = evaluate(config, c.traindata_loader, local_model, device)
+        train_loss.append(train_res[0])
+        train_acc.append(train_res[1])
+        val_res = evaluate(config, c.valdata_loader, local_model, device)
+        val_loss.append(val_res[0])
+        val_acc.append(val_res[1])
+        test_res = evaluate(config, c.testdata_loader, local_model, device)
+        test_loss.append(test_res[0])
+        test_acc.append(test_res[1])
+    print('\nLast Personalized Train loss: {:.5f}, train accuracy: {:.5f}'.format(sum(train_loss) / len(train_loss),
+                                                                                  sum(train_acc) / len(train_acc)))
+    print("Last Personalized Round {}, Validation loss: {:.5f}, "
+          "val accuracy: {:.5f}".format(round, sum(val_loss) / len(val_loss),
+                                        sum(val_acc) / len(val_acc)))
+    print("Last Personalized Round {}, test loss: {:.5f}, "
+          "test accuracy: {:.5f}".format(round, sum(test_loss) / len(test_loss),
+                                         sum(test_acc) / len(test_acc)), flush=True)
+    

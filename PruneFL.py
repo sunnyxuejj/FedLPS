@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# @python: 3.8
+# @python: 3.7
 import copy
 import os
 
@@ -8,24 +8,28 @@ import torch
 import torch.nn as nn
 import pickle
 from tqdm import tqdm
-
+from agg.avg import *
 from torch.utils.data import DataLoader
-from util import repackage_hidden
 from Text import DatasetLM
 from utils.options import args_parser
-from util import get_dataset_mnist_extr_noniid, get_dataset_cifar10_extr_noniid, train_val_test_image
+from util import get_dataset_mnist_extr_noniid, get_dataset_cifar10_extr_noniid, get_dataset_cifar100_extr_noniid, \
+    get_dataset_tiny_extr_noniid, train_val_test_image, repackage_hidden
 from utils.main_flops_counter import count_training_flops
+from dataset import DatasetSplit
 from Models import all_models, needs_mask
 from data.reddit.user_data import data_process
-from FedLPS import evaluate
+from Client import Client, evaluate
+from FedAvg import make_capacity
 import warnings
+
 warnings.filterwarnings('ignore')
 
 args = args_parser()
+FLOPS_capacity = [46528.0, 93056.0, 186112.0, 372224.0, 744448.0]
 
 
 def initialize_mask_layer(layer, dtype=torch.bool):
-    if isinstance(layer, torch.nn.Conv2d) or isinstance(layer, torch.nn.LSTM) or isinstance(layer, torch.nn.Linear) or\
+    if isinstance(layer, torch.nn.Conv2d) or isinstance(layer, torch.nn.LSTM) or isinstance(layer, torch.nn.Linear) or \
             isinstance(layer, torch.nn.Embedding) or isinstance(layer, torch.nn.GRU):
         for name, param in layer.named_parameters():
             if 'weight' in name:
@@ -60,80 +64,13 @@ def count_layerwise_params_num(model, config):
     return layer_times
 
 
-class Client:
-    def __init__(self, args, device, id, train_data, val_data, test_data, local_net, initial_global_params):
-        '''Construct a new client.
-        Parameters:
-        args:
-            related parameters settings
-        device: 'cpu' or 'cuda'
-            running device label
-        id : object
-            a unique identifier for this client.
-        train_data : iterable of tuples of (x, y)
-            a DataLoader or other iterable giving us training samples.
-        val_data : iterable of tuples of (x, y)
-            a DataLoader or other iterable giving us validation samples.
-        test_data : iterable of tuples of (x, y)
-            a DataLoader or other iterable giving us test samples.
-            (we will use this as the validation set.)
-        initial_global_params : dict
-            initial global model parameters
-        lr: float
-            current learning rate
-
-        Returns: a new client.
-        '''
-
-        self.args = args
-        self.device = device
-        self.id = id
-        self.train_data, self.val_data, self.test_data = train_data, val_data, test_data
-        self.criterion = nn.CrossEntropyLoss()
-
-        self.learning_rate = args.lr
-
-        self.local_epochs = args.local_ep
-        self.curr_round = 0
-        self.curr_epoch = 0
-
-        # save the initial global params given to us by the server
-        # for LTH pruning later.
-        self.local_net = local_net.to(device)
+class Client_PruneFL(Client):
+    def __init__(self, *args, **kwargs):
+        super(Client_PruneFL, self).__init__(*args, **kwargs)
         initialize_mask(self.local_net)
-        self.model_trans = copy.deepcopy(self.local_net)
-        self.initial_global_params = initial_global_params
-        self.best_val_acc = None
-        self.save_parameters = None
-        self.final_parameters = None
-
-        if self.args.dataset == 'reddit' or self.args.dataset == 'cifar10':
-            self.loss_func = nn.CrossEntropyLoss().to(self.device)
-        else:
-            self.loss_func = nn.NLLLoss().to(self.device)
-        self.l1_penalty = nn.L1Loss().to(self.device)
-        self.l2_penalty = nn.MSELoss().to(self.device)
-        self.reset_optimizer()
-
-        self.traindata_loader = DataLoader(train_data, batch_size=self.args.local_bs, shuffle=True)
-        if args.dataset == 'reddit':
-            self.valdata_loader = DataLoader(val_data, batch_size=1, shuffle=False)
-            self.testdata_loader = DataLoader(test_data, batch_size=1, shuffle=False)
-        else:
-            self.valdata_loader = DataLoader(val_data, batch_size=self.args.local_bs, shuffle=False)
-            self.testdata_loader = DataLoader(test_data, batch_size=self.args.local_bs, shuffle=False)
 
     def train_size(self):
         return sum(len(x) for x in self.train_data)
-
-    def reset_optimizer(self, round=0):
-        if self.args.optimizer == 'sgd':
-            self.optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, self.local_net.parameters()),
-                                             lr=self.args.lr * (self.args.lr_decay ** round),
-                                             momentum=self.args.momentum, weight_decay=self.args.wdecay)
-        elif self.args.optimizer == 'adam':
-            self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.local_net.parameters()),
-                                              lr=self.learning_rate, weight_decay=self.args.wdecay)
 
     def reset_weights(self, *args, **kwargs):
         return self.local_net.reset_weights(*args, **kwargs)
@@ -155,7 +92,7 @@ class Client:
             dl_cost += self.local_net.mask_size  # need to receive mask
         dl_cost += self.local_net.stat_param_sizes()
 
-        #pre_training_state = {k: v.clone() for k, v in self.net.state_dict().items()}
+        # pre_training_state = {k: v.clone() for k, v in self.net.state_dict().items()}
         for iter in range(self.args.local_ep):
 
             self.local_net.train()
@@ -192,8 +129,7 @@ class Client:
                 self.reset_weights()  # applies the mask
 
             train_flops += len(self.traindata_loader) * count_training_flops(copy.deepcopy(self.local_net),
-                                                                            self.args)
-            self.curr_epoch += 1
+                                                                             self.args)
 
             acc = corrent / total
             epoch_acc.append(acc)
@@ -227,7 +163,52 @@ if __name__ == "__main__":
     config.device = device
 
     dataset_train, dataset_val, dataset_test, data_num = {}, {}, {}, {}
-    if args.dataset == 'reddit':
+    if args.dataset == 'mnist':
+        idx_vals = []
+        total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_mnist_extr_noniid(
+            args.nusers,
+            args.nclass,
+            args.nsamples,
+            args.rate_unbalance)
+        for i in range(args.nusers):
+            idx_val, dataset_train[i], dataset_val[i], dataset_test[i] = train_val_test_image(total_train_data,
+                                                                                              list(
+                                                                                                  dataset_train_idx[i]),
+                                                                                              total_test_data,
+                                                                                              list(dataset_test_idx[i]))
+            idx_vals.append(idx_val)
+            data_num[i] = len(dataset_train[i])
+    elif args.dataset == 'cifar10':
+        idx_vals = []
+        total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_cifar10_extr_noniid(
+            args.nusers,
+            args.nclass,
+            args.nsamples,
+            args.rate_unbalance)
+        for i in range(args.nusers):
+            idx_val, dataset_train[i], dataset_val[i], dataset_test[i] = train_val_test_image(total_train_data,
+                                                                                              list(
+                                                                                                  dataset_train_idx[i]),
+                                                                                              total_test_data,
+                                                                                              list(dataset_test_idx[i]))
+            idx_vals.append(idx_val)
+            data_num[i] = len(dataset_train[i])
+    elif args.dataset == 'cifar100':
+        idx_vals = []
+        total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_cifar100_extr_noniid(
+            args.nusers,
+            args.nclass,
+            args.nsamples,
+            args.rate_unbalance)
+        for i in range(args.nusers):
+            idx_val, dataset_train[i], dataset_val[i], dataset_test[i] = train_val_test_image(total_train_data,
+                                                                                              list(
+                                                                                                  dataset_train_idx[i]),
+                                                                                              total_test_data,
+                                                                                              list(dataset_test_idx[i]))
+            idx_vals.append(idx_val)
+            data_num[i] = len(dataset_train[i])
+    elif args.dataset == 'reddit':
         # dataload
         data_dir = 'data/reddit/train/'
         with open('data/reddit/reddit_vocab.pck', 'rb') as f:
@@ -240,39 +221,24 @@ if __name__ == "__main__":
             dataset_val[i] = DatasetLM(val_data[i], vocab['vocab'])
             dataset_test[i] = DatasetLM(test_data[i], vocab['vocab'])
             data_num[i] = len(train_data[i])
-        all_val, all_test = [], []
-        for value in val_data.values():
-            for sent in value:
-                all_val.append(sent)
-        for value in test_data.values():
-            for sent in value:
-                all_test.append(sent)
-    elif args.dataset == 'mnist':
+    elif args.dataset == 'tinyimagenet':
         idx_vals = []
-        total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_mnist_extr_noniid(args.nusers,
-                                                                                                      args.nclass,
-                                                                                                      args.nsamples,
-                                                                                                      args.rate_unbalance)
+        total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_tiny_extr_noniid(
+            args.nusers,
+            args.nclass,
+            args.nsamples,
+            args.rate_unbalance)
         for i in range(args.nusers):
             idx_val, dataset_train[i], dataset_val[i], dataset_test[i] = train_val_test_image(total_train_data,
-                                                                                              list(dataset_train_idx[i]),
+                                                                                              list(
+                                                                                                  dataset_train_idx[i]),
                                                                                               total_test_data,
                                                                                               list(dataset_test_idx[i]))
             idx_vals.append(idx_val)
             data_num[i] = len(dataset_train[i])
-    elif args.dataset == 'cifar10':
-        idx_vals = []
-        total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_cifar10_extr_noniid(args.nusers,
-                                                                                                      args.nclass,
-                                                                                                      args.nsamples,
-                                                                                                      args.rate_unbalance)
-        for i in range(args.nusers):
-            idx_val, dataset_train[i], dataset_val[i], dataset_test[i] = train_val_test_image(total_train_data,
-                                                                                              list(dataset_train_idx[i]),
-                                                                                              total_test_data,
-                                                                                              list(dataset_test_idx[i]))
-            idx_vals.append(idx_val)
-            data_num[i] = len(dataset_train[i])
+        val_list = [i for item in idx_vals for i in item]
+        loader_val = DataLoader(DatasetSplit(total_train_data, val_list), batch_size=args.bs, shuffle=True)
+        loader_test = DataLoader(total_test_data, batch_size=args.bs, shuffle=True)
 
     best_val_loss = None
     os.makedirs(f'./log/{args.dataset}/', exist_ok=True)
@@ -293,6 +259,10 @@ if __name__ == "__main__":
     model_indicator.to(device)
     model_indicator.label_mask_weight()
     mask_weight_indicator = model_indicator.mask_weight_indicator
+    # if first_layer in mask_weight_indicator:
+    #     mask_weight_indicator = mask_weight_indicator[1:]
+    # if last_layer in mask_weight_indicator:
+    #     mask_weight_indicator = mask_weight_indicator[:-1]
     config.mask_weight_indicator = copy.deepcopy(mask_weight_indicator)
 
     # initialized global model
@@ -307,20 +277,17 @@ if __name__ == "__main__":
     # initialize clients
     clients = {}
     client_ids = []
+    config.proportion = [1, 1, 1, 1, 1]
+    rate_idx = torch.multinomial(torch.tensor(config.proportion).float(), num_samples=config.nusers,
+                                 replacement=True).tolist()
+    client_capacity = np.array(FLOPS_capacity)[rate_idx]
     for client_id in range(args.nusers):
-        cl = Client(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
-                    dataset_test[client_id],
-                    local_net=all_models[args.dataset](config, device), initial_global_params=initial_global_params)
+        cl = Client_PruneFL(config, device, client_id, dataset_train[client_id], dataset_val[client_id],
+                            dataset_test[client_id],
+                            local_net=all_models[args.dataset](config, device))
         clients[client_id] = cl
         client_ids.append(client_id)
         torch.cuda.empty_cache()
-
-
-    # we need to accumulate compute/DL/UL costs regardless of round number, resetting only
-    # when we actually report these numbers
-    compute_flops = np.zeros(len(clients))  # the total floating operations for each client
-    download_cost = np.zeros(len(clients))
-    upload_cost = np.zeros(len(clients))
 
     # pick a client randomly and perform some local readjustment there only.
     # all clients are equally bad in this setting
@@ -344,178 +311,158 @@ if __name__ == "__main__":
         net_glob.load_state_dict(initial_client.local_net.state_dict())
         if len(last_differences) >= 5 and all(x < 0.1 for x in last_differences[-5:]):
             break
-    upload_cost[0] += train_result['ul_cost']
 
-    try:
-        for round in range(args.rounds):
-            upload_cost_round = []
-            download_cost_round = []
-            compute_flops_round = []
-            w_locals, loss_locals, acc_locals = [], [], []
+    for round in range(args.rounds):
+        client_capacity = make_capacity(config, client_capacity)
+        upload_cost_round, uptime = [], []
+        download_cost_round, down_time = [], []
+        compute_flops_round, training_time = [], []
+        w_locals, loss_locals, acc_locals = [], [], []
 
-            m = max(int(args.frac * len(clients)), 1)
-            idxs_users = np.random.choice(len(clients), m, replace=False)  # 随机采样client
+        m = max(int(args.frac * len(clients)), 1)
+        idxs_users = np.random.choice(len(clients), m, replace=False)  # 随机采样client
 
-            w_glob = net_glob.state_dict()
-            aggregated_params = {}
-            aggregated_params_for_mask = {}
-            aggregated_masks = {}
-            aggregated_gradients = []
-            # set server parameters to 0 in preparation for aggregation,
-            for name, param in w_glob.items():
-                if name.endswith('_mask'):
-                    continue
-                aggregated_params[name] = torch.zeros_like(param, dtype=torch.float, device='cpu')
-                aggregated_params_for_mask[name] = torch.zeros_like(param, dtype=torch.float, device='cpu')
-                if needs_mask(name, mask_weight_indicator):
-                    aggregated_masks[name] = torch.zeros_like(param, device='cpu')
-                    aggregated_gradients.append(torch.zeros_like(param, device='cpu'))
+        w_glob = net_glob.state_dict()
+        aggregated_params = {}
+        aggregated_params_for_mask = {}
+        aggregated_masks = {}
+        w_locals = []
+        aggregated_gradients = []
+        # set server parameters to 0 in preparation for aggregation,
+        for name, param in w_glob.items():
+            if name.endswith('_mask'):
+                continue
+            aggregated_params[name] = torch.zeros_like(param, dtype=torch.float, device='cpu')
+            aggregated_params_for_mask[name] = torch.zeros_like(param, dtype=torch.float, device='cpu')
+            if needs_mask(name, mask_weight_indicator):
+                aggregated_masks[name] = torch.zeros_like(param, device='cpu')
+                aggregated_gradients.append(torch.zeros_like(param, device='cpu'))
 
-            for idx in idxs_users:
-                client = clients[idx]
-                i = client_ids.index(idx)
-                readjust = (round - 1) % config.rounds_between_readjustments == 0
+        for idx in idxs_users:
+            client = clients[idx]
+            i = client_ids.index(idx)
+            readjust = (round - 1) % config.rounds_between_readjustments == 0
 
-                # 进行本地训练
-                train_result = client.train(w_server=w_glob, round=round)
-                cl_params = train_result['state']
-                loss_locals.append(train_result['loss'])
-                acc_locals.append(train_result['acc'])
+            # 进行本地训练
+            train_result = client.train(w_server=w_glob, round=round)
+            cl_params = train_result['state']
+            w_locals.append(train_result['state'])
+            loss_locals.append(train_result['loss'])
+            acc_locals.append(train_result['acc'])
 
-                download_cost[i] += train_result['dl_cost']
-                download_cost_round.append(train_result['dl_cost'])
-                upload_cost[i] += train_result['ul_cost']
-                upload_cost_round.append(train_result['ul_cost'])
-                compute_flops[i] += train_result['train_flops']
-                compute_flops_round.append(train_result['train_flops'])
+            download_cost_round.append(train_result['dl_cost'])
+            down_time.append(train_result['dl_cost'] / 8 / 1024 / 1024 / 110.6)
+            upload_cost_round.append(train_result['ul_cost'])
+            uptime.append(train_result['ul_cost'] / 8 / 1024 / 1024 / 14.0)
+            compute_flops_round.append(train_result['train_flops'])
+            training_time.append(train_result['train_flops'] / 1e6 / client_capacity[idx])
 
-                # first deduce masks for the received weights
-                cl_weight_params = {}
-                cl_mask_params = {}
-                for name, cl_param in cl_params.items():
-                    if name.endswith('_orig'):
-                        name = name[:-5]
-                    elif name.endswith('_mask'):
-                        name = name[:-5]
-                        cl_mask_params[name] = cl_param.to(device='cpu', copy=True)
-                        continue
-
-                    cl_weight_params[name] = cl_param.to(device='cpu', copy=True)
-
-                # at this point, we have weights and masks (possibly all-ones)
-                # for this client. we will proceed by applying the mask and adding
-                # the masked received weights to the aggregate, and adding the mask
-                # to the aggregate as well.
-                for name, cl_param in cl_weight_params.items():
-                    if name in cl_mask_params:
-                        # things like weights have masks
-                        cl_mask = cl_mask_params[name]
-                        sv_mask = w_glob[name + '_mask'].to('cpu', copy=True)
-
-                        aggregated_params[name].add_(client.train_size() * cl_param * cl_mask)
-                        aggregated_params_for_mask[name].add_(client.train_size() * cl_param * cl_mask)
-                        aggregated_masks[name].add_(client.train_size() * cl_mask)
-                    else:
-                        # things like biases don't have masks
-                        aggregated_params[name].add_(client.train_size() * cl_param)
-
-                # get gradients
-                grad_i = 0
-                for name, param in client.local_net.named_parameters():
-                    if not needs_mask(name, mask_weight_indicator):
-                        continue
-                    aggregated_gradients[grad_i].add_(param.grad.to('cpu'))
-                    grad_i += 1
-
-            # divide gradients
-            for g in aggregated_gradients:
-                g.div_(len(idxs_users))
-
-            loss_avg = sum(loss_locals) / len(loss_locals)
-            acc_avg = sum(acc_locals) / len(acc_locals)
-            print('\nTrain loss: {:.5f}, train accuracy: {:.5f}'.format(loss_avg, acc_avg))
-            print('Max upload cost: {:.3f} MB, Max download cost: {:.3f} '
-                  'MB'.format(max(upload_cost_round) / 8 / 1024 / 1024, max(download_cost_round) / 8 / 1024 / 1024))
-            print('Max compute flops cost: {:.3f} MB'.format(max(compute_flops_round) / 1e6))
-
-            # at this point, we have the sum of client parameters
-            # in aggregated_params, and the sum of masks in aggregated_masks. We
-            # can take the average now by simply dividing...
-            for name, param in aggregated_params.items():
-
-                # if this parameter has no associated mask, simply take the average.
-                if name not in aggregated_masks:
-                    aggregated_params[name] /= sum(clients[i].train_size() for i in idxs_users)
-                    # aggregated_params_for_mask[name] /= sum(clients[i].train_size() for i in client_indices)
+            # first deduce masks for the received weights
+            cl_weight_params = {}
+            cl_mask_params = {}
+            for name, cl_param in cl_params.items():
+                if name.endswith('_orig'):
+                    name = name[:-5]
+                elif name.endswith('_mask'):
+                    name = name[:-5]
+                    cl_mask_params[name] = cl_param.to(device='cpu', copy=True)
                     continue
 
-                # otherwise, we are taking the weighted average w.r.t. the number of
-                # samples present on each of the clients.
-                aggregated_params[name] /= aggregated_masks[name]
-                aggregated_params_for_mask[name] /= aggregated_masks[name]
-                aggregated_masks[name] /= aggregated_masks[name]
+                cl_weight_params[name] = cl_param.to(device='cpu', copy=True)
 
-                # it's possible that some weights were pruned by all clients. In this
-                # case, we will have divided by zero. Those values have already been
-                # pruned out, so the values here are only placeholders.
-                aggregated_params[name] = torch.nan_to_num(aggregated_params[name],
-                                                           nan=0.0, posinf=0.0, neginf=0.0)
-                aggregated_params_for_mask[name] = torch.nan_to_num(aggregated_params[name],
-                                                                    nan=0.0, posinf=0.0, neginf=0.0)
-                aggregated_masks[name] = torch.nan_to_num(aggregated_masks[name],
-                                                          nan=0.0, posinf=0.0, neginf=0.0)
+            # at this point, we have weights and masks (possibly all-ones)
+            # for this client. we will proceed by applying the mask and adding
+            # the masked received weights to the aggregate, and adding the mask
+            # to the aggregate as well.
+            for name, cl_param in cl_weight_params.items():
+                if name in cl_mask_params:
+                    # things like weights have masks
+                    cl_mask = cl_mask_params[name]
+                    sv_mask = w_glob[name + '_mask'].to('cpu', copy=True)
 
-            # masks are parameters too!
-            for name, mask in aggregated_masks.items():
-                aggregated_params[name + '_mask'] = mask
-                aggregated_params_for_mask[name + '_mask'] = mask
+                    aggregated_params[name].add_(client.train_size() * cl_param * cl_mask)
+                    aggregated_params_for_mask[name].add_(client.train_size() * cl_param * cl_mask)
+                    aggregated_masks[name].add_(client.train_size() * cl_mask)
+                else:
+                    # things like biases don't have masks
+                    aggregated_params[name].add_(client.train_size() * cl_param)
 
-            # reset global params to aggregated values
-            net_glob.load_state_dict(aggregated_params_for_mask)
+            # get gradients
+            grad_i = 0
+            for name, param in client.local_net.named_parameters():
+                if not needs_mask(name, mask_weight_indicator):
+                    continue
+                aggregated_gradients[grad_i].add_(param.grad.to('cpu'))
+                grad_i += 1
 
-            # perform readjustment using aggregated_gradients
-            if readjust:
-                net_glob.prunefl_readjust(aggregated_gradients, layer_times, prunable_params=0.3 * 0.5 ** round)
+        # divide gradients
+        for g in aggregated_gradients:
+            g.div_(len(idxs_users))
 
-            # evaluate performance
-            torch.cuda.empty_cache()
-            glob_val_loss, glob_val_acc = [], []
-            for _, c in clients.items():
-                glob_val_res = evaluate(config, c.valdata_loader, copy.deepcopy(net_glob), device)
-                glob_val_loss.append(glob_val_res[0])
-                glob_val_acc.append(glob_val_res[1])
-            print("Personalized Round {}, Validation loss: {:.5f}, "
-                  "val accuracy: {:.5f}".format(round, sum(glob_val_loss) / len(glob_val_loss),
-                                                sum(glob_val_acc) / len(glob_val_acc)))
+        # at this point, we have the sum of client parameters
+        # in aggregated_params, and the sum of masks in aggregated_masks. We
+        # can take the average now by simply dividing...
+        for name, param in aggregated_params.items():
 
-            if not best_val_loss or sum(glob_val_acc) / len(glob_val_acc) > best_val_loss:
-                with open(model_saved, 'wb') as f:
-                    print('save model')
-                    torch.save(net_glob, f)
-                best_val_loss = sum(glob_val_acc) / len(glob_val_acc)
+            # if this parameter has no associated mask, simply take the average.
+            if name not in aggregated_masks:
+                aggregated_params[name] /= sum(clients[i].train_size() for i in idxs_users)
+                # aggregated_params_for_mask[name] /= sum(clients[i].train_size() for i in client_indices)
+                continue
 
-            glob_test_loss, glob_test_acc = [], []
-            for _, c in clients.items():
-                glob_test_res = evaluate(config, c.testdata_loader, copy.deepcopy(net_glob), device)
-                glob_test_loss.append(glob_test_res[0])
-                glob_test_acc.append(glob_test_res[1])
-            print("Test Global Round {}, test loss: {:.5f}, test accuracy: {:.5f}".format(round,
-                                                                                          sum(glob_test_loss) / len(
-                                                                                              glob_test_loss),
-                                                                                          sum(glob_test_acc) / len(
-                                                                                              glob_test_acc)))
+            # otherwise, we are taking the weighted average w.r.t. the number of
+            # samples present on each of the clients.
+            aggregated_params[name] /= aggregated_masks[name]
+            aggregated_params_for_mask[name] /= aggregated_masks[name]
+            aggregated_masks[name] /= aggregated_masks[name]
 
-    except KeyboardInterrupt:
-        print('-' * 89)
-        print('Existing from training early')
+            # it's possible that some weights were pruned by all clients. In this
+            # case, we will have divided by zero. Those values have already been
+            # pruned out, so the values here are only placeholders.
+            aggregated_params[name] = torch.nan_to_num(aggregated_params[name],
+                                                       nan=0.0, posinf=0.0, neginf=0.0)
+            aggregated_params_for_mask[name] = torch.nan_to_num(aggregated_params[name],
+                                                                nan=0.0, posinf=0.0, neginf=0.0)
+            aggregated_masks[name] = torch.nan_to_num(aggregated_masks[name],
+                                                      nan=0.0, posinf=0.0, neginf=0.0)
 
-    with open(model_saved, 'rb') as f:
-        model_best = torch.load(f)
+        aggregated_params_for_mask = average_w(w_locals)
 
-    per_test_loss, per_test_acc = [], []
-    for _, c in clients.items():
-        per_test_res = evaluate(config, c.testdata_loader, model_best, device)
-        per_test_loss.append(per_test_res[0])
-        per_test_acc.append(per_test_res[1])
-    print("test loss: {:.5f}, test accuracy: {:.5f}".format(sum(per_test_loss) / len(per_test_loss),
-                                                                        sum(per_test_acc) / len(per_test_acc)))
+        # masks are parameters too!
+        for name, mask in aggregated_masks.items():
+            aggregated_params[name + '_mask'] = mask
+            aggregated_params_for_mask[name + '_mask'] = mask
+
+        # reset global params to aggregated values
+        net_glob.load_state_dict(aggregated_params_for_mask)
+
+        # evaluate performance
+        torch.cuda.empty_cache()
+        train_loss, train_acc = [], []
+        glob_val_loss, glob_val_acc = [], []
+        glob_test_loss, glob_test_acc = [], []
+        for _, c in clients.items():
+            train_res = evaluate(config, c.traindata_loader, copy.deepcopy(net_glob), device)
+            train_loss.append(train_res[0])
+            train_acc.append(train_res[1])
+            glob_val_res = evaluate(config, c.valdata_loader, copy.deepcopy(net_glob), device)
+            glob_val_loss.append(glob_val_res[0])
+            glob_val_acc.append(glob_val_res[1])
+            glob_test_res = evaluate(config, c.testdata_loader, copy.deepcopy(net_glob), device)
+            glob_test_loss.append(glob_test_res[0])
+            glob_test_acc.append(glob_test_res[1])
+        print('\nRound {}, Train loss: {:.5f}, train accuracy: {:.5f}'.format(round, sum(train_loss) / len(train_loss),
+                                                                              sum(train_acc) / len(train_acc)))
+        print('Max upload cost: {:.3f} MB, Max download cost: {:.3f} '
+              'MB'.format(max(upload_cost_round) / 8 / 1024 / 1024, max(download_cost_round) / 8 / 1024 / 1024))
+        print('Sum compute flops cost: {:.3f} MB'.format(sum(compute_flops_round) / 1e6))
+        print('Max time for upload time: {:.5f} s, Max time for download: {:.5f} s'.format(max(uptime), max(down_time)))
+        print('Max local training time: {:.5f} s'.format(max(training_time)), flush=True)
+        print("Validation loss: {:.5f}, "
+              "val accuracy: {:.5f}".format(sum(glob_val_loss) / len(glob_val_loss),
+                                            sum(glob_val_acc) / len(glob_val_acc)))
+        print("test loss: {:.5f}, test accuracy: {:.5f}".format(sum(glob_test_loss) / len(glob_test_loss),
+                                                                sum(glob_test_acc) / len(glob_test_acc)), flush=True)
+
+        if readjust:
+            net_glob.prunefl_readjust(aggregated_gradients, layer_times, prunable_params=0.3 * 0.5 ** round)
