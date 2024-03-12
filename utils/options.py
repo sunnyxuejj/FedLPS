@@ -20,7 +20,7 @@ def args_parser():
     # learning arguments
     parser.add_argument('--rounds', type=int, default=100, help="rounds of training")
     parser.add_argument('--nusers', type=int, default=100, help="number of users: K")
-    parser.add_argument('--frac', type=float, default=0.02, help='the fraction of clients: C')
+    parser.add_argument('--frac', type=float, default=0.1, help='the fraction of clients: C')
     parser.add_argument('--local_ep', type=int, default=5, help="the number of local epochs: E")
     parser.add_argument('--local_bs', type=int, default=32, help="local batch size: B")
     parser.add_argument('--optimizer', type=str, default='sgd', help='optimizer to use (sgd, adam)')
@@ -29,7 +29,7 @@ def args_parser():
     parser.add_argument('--lr_decay', type=float, default=0.998, metavar='LR_decay',
                         help='learning rate decay (default: 0.998)')
     parser.add_argument('--clip', type=float, default=0, help='gradient clipping')
-    parser.add_argument('--momentum', type=float, default=0.5, help='SGD momentum (default: 0.5)')
+    parser.add_argument('--momentum', type=float, default=0, help='SGD momentum (default: 0.5)')
     parser.add_argument('--epsilon', type=float, default=1.2, help='stepsize')
     parser.add_argument('--ord', type=int, default=2, help='similarity metric')
     parser.add_argument('--dp', type=float, default=0.001, help='differential privacy')
@@ -46,30 +46,21 @@ def args_parser():
     parser.add_argument('--lamda_mask', type=float, default=0.0001, help='loss corr lamda_mask')
 
     # model arguments
-    parser.add_argument('--d_embed', type=int, default=300, help='embedding dimension')
+    parser.add_argument('--d_embed', type=int, default=200, help='embedding dimension')
     parser.add_argument('--d_dict', type=int, default=10000, help='size of the dictionary of embeddings')
     parser.add_argument('--dropout', type=float, default=0.3, help='dropout rate')
     # for RNN
-    parser.add_argument('--tied', action='store_true', help="Use tied input/output embedding weights: 1 for true")
     parser.add_argument('--rnn_type', type=str, default='LSTM', help='type of RNN')
-    parser.add_argument("--rnn_hidden", type=int, default=300, help="RNN hidden unit dimensionality")
+    parser.add_argument("--rnn_hidden", type=int, default=256, help="RNN hidden unit dimensionality")
     parser.add_argument("--rnn_layers", type=int, default=2, help="Number of RNN layers")
-    parser.add_argument('--dropout_hh', type=float, default=0.65,
-                        help='amount of weight dropout to apply to the RNN hidden to hidden matrix')
-    parser.add_argument('--dropouti', type=float, default=0.1,
-                        help='amount of weight dropout to input embedding layer')
-    parser.add_argument('--dropouth', type=float, default=0.3,
-                        help='amount of weight dropout to rnn layer')
-    parser.add_argument('--dropout_emd', type=float, default=0.1,
-                        help='dropout to remove words from embedding layer (0 = no dropout)')
     parser.add_argument('--tie_weights', type=bool, default=True, help='')
 
     # method arguments
     parser.add_argument('--agg', type=str, default='avg', help='averaging strategy')
-    parser.add_argument('--fedprox', type=bool, default=True, help='whether fedprox')
+    parser.add_argument('--fedprox', type=bool, default=False, help='whether fedprox')
     parser.add_argument('--lamda', type=float, default=0.001, help='the regulization coffient of fedprox and Hermes')
     parser.add_argument('--sample_rate', type=float, default=0.5, help='')
-    parser.add_argument('--mask', type=bool, default=True, help='used mask')
+    parser.add_argument('--mask', type=bool, default=False, help='used mask')
     parser.add_argument("--learnable", type=bool, default=False)
     parser.add_argument('--mask_rate', type=float, default=0.5, help='mask rate')
 
