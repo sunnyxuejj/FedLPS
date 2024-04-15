@@ -8,9 +8,14 @@ The pytorch version for FedLPS
 - Tiny-Imagenet ([FedLPS_AE](https://zenodo.org/records/10811717))
 - Reddit (in data/reddit/)
 
-## Running Example
+## Running FedLPS
 ```
-cd /script/P-UCBV/
-sh cifar10_P-UCBV_dyn.sh
+cd /script/
+sh cifar100_FedLPS.sh
 ```
 
+# Running Baseline
+```
+cd /script_baseline/
+sh cifar100_FedLPS.sh
+```
