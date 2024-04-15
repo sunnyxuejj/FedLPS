@@ -14,8 +14,8 @@ cd /script/
 sh cifar100_FedLPS.sh
 ```
 
-# Running Baseline
+## Running Baselines
 ```
-cd /script_baseline/
-sh cifar100_FedLPS.sh
+cd /script_baselines/FedAvg/
+sh cifar100_FedAvg.sh
 ```
