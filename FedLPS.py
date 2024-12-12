@@ -4,13 +4,16 @@
 import os
 import math
 import pickle
+import pandas as pd
 
-from Text import DatasetLM
+from torch.utils.data import DataLoader
+from torchtext import data
 from Hetero_Client import Hetero_Client
 from agg.avg import *
 from utils.options import args_parser
 from util import get_dataset_mnist_extr_noniid, get_dataset_cifar10_extr_noniid, get_dataset_cifar100_extr_noniid, \
-    get_dataset_tiny_extr_noniid, train_val_test_image
+    get_dataset_tiny_extr_noniid, train_val_test_image, repackage_hidden
+from dataset import DatasetSplit
 from data.reddit.user_data import data_process
 from Models import all_models
 from Client import evaluate
@@ -43,10 +46,12 @@ def make_model_rate(config, clients_model_rate, client_capacity):
 
 
 if __name__ == "__main__":
-    args.mask = True
-    args.learnable = True
-    args.online_decision = True
     config = args
+    config.mask = True
+    config.learnable = True
+    config.personalized = True
+    config.online_decision = True
+    args.strategy = 'FedLPS'
 
     torch.cuda.set_device(args.gpu)
     torch.manual_seed(args.seed)
@@ -59,7 +64,6 @@ if __name__ == "__main__":
 
     dataset_train, dataset_val, dataset_test, data_num = {}, {}, {}, {}
     if args.dataset == 'mnist':
-        idx_vals = []
         total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_mnist_extr_noniid(
             args.nusers,
             args.nclass,
@@ -71,10 +75,8 @@ if __name__ == "__main__":
                                                                                                   dataset_train_idx[i]),
                                                                                               total_test_data,
                                                                                               list(dataset_test_idx[i]))
-            idx_vals.append(idx_val)
             data_num[i] = len(dataset_train[i])
     elif args.dataset == 'cifar10':
-        idx_vals = []
         total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_cifar10_extr_noniid(
             args.nusers,
             args.nclass,
@@ -86,10 +88,8 @@ if __name__ == "__main__":
                                                                                                   dataset_train_idx[i]),
                                                                                               total_test_data,
                                                                                               list(dataset_test_idx[i]))
-            idx_vals.append(idx_val)
             data_num[i] = len(dataset_train[i])
     elif args.dataset == 'cifar100':
-        idx_vals = []
         total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_cifar100_extr_noniid(
             args.nusers,
             args.nclass,
@@ -101,23 +101,8 @@ if __name__ == "__main__":
                                                                                                   dataset_train_idx[i]),
                                                                                               total_test_data,
                                                                                               list(dataset_test_idx[i]))
-            idx_vals.append(idx_val)
             data_num[i] = len(dataset_train[i])
-    elif args.dataset == 'reddit':
-        # dataload
-        data_dir = './data/reddit/train/'
-        with open('./data/reddit/reddit_vocab.pck', 'rb') as f:
-            vocab = pickle.load(f)
-        nvocab = vocab['size']
-        config.nvocab = nvocab
-        train_data, val_data, test_data = data_process(data_dir, nvocab, args.nusers)
-        for i in range(args.nusers):
-            dataset_train[i] = DatasetLM(train_data[i], vocab['vocab'])
-            dataset_val[i] = DatasetLM(val_data[i], vocab['vocab'])
-            dataset_test[i] = DatasetLM(test_data[i], vocab['vocab'])
-            data_num[i] = len(train_data[i])
     elif args.dataset == 'tinyimagenet':
-        idx_vals = []
         total_train_data, total_test_data, dataset_train_idx, dataset_test_idx = get_dataset_tiny_extr_noniid(
             args.nusers,
             args.nclass,
@@ -129,12 +114,11 @@ if __name__ == "__main__":
                                                                                                   dataset_train_idx[i]),
                                                                                               total_test_data,
                                                                                               list(dataset_test_idx[i]))
-            idx_vals.append(idx_val)
             data_num[i] = len(dataset_train[i])
 
     best_val_acc = None
     os.makedirs(f'./log/{args.dataset}/', exist_ok=True)
-    model_saved = './log/{}/model_FedLPS_{}.pt'.format(args.dataset, args.seed)
+    model_saved = './log/{}/model_{}_{}.pt'.format(args.dataset, args.strategy, args.seed)
 
     # 确定哪些层可以被mask
     config.mask_weight_indicator = []
@@ -184,6 +168,12 @@ if __name__ == "__main__":
         client_ids.append(client_id)
         torch.cuda.empty_cache()
 
+    # we need to accumulate compute/DL/UL costs regardless of round number, resetting only
+    # when we actually report these numbers
+    compute_flops = np.zeros(len(clients))  # the total floating operations for each client
+    download_cost = np.zeros(len(clients))
+    upload_cost = np.zeros(len(clients))
+
     for round in range(args.rounds):
         clients_mask_rate, client_capacity = make_model_rate(config, clients_mask_rate, client_capacity)
         upload_cost_round, uptime = [], []
@@ -199,8 +189,9 @@ if __name__ == "__main__":
             client = clients[idx]
             i = client_ids.index(idx)
             client.mask_rate = clients_mask_rate[i]
-            mab_mask_rate, action_index = client.P_UCBV()
-            client.mask_rate = min(client.mask_rate, mab_mask_rate)
+            if args.online_decision:
+                mab_mask_rate, action_index = client.P_UCBV()
+                client.mask_rate = min(client.mask_rate, mab_mask_rate)
             train_result = client.update_weights_leanable(w_server=copy.deepcopy(w_glob), round=round)
             w_locals.append(train_result['state'])
             loss_locals.append(train_result['loss'])
@@ -239,8 +230,8 @@ if __name__ == "__main__":
                 client.pull_times = np.delete(client.pull_times, action_index)
                 del client.arms_reward[client.mab_arms[action_index][0]]
 
-        # global aggregation
-        w_glob = avg(w_locals, w_glob, args, device)
+        if args.agg == 'avg':
+            w_glob = avg(w_locals, w_glob, args, device)
         if config.dataset == 'reddit':
             w_glob[last_layer] = copy.deepcopy(w_glob[first_layer])
         net_glob.load_state_dict(w_glob)
@@ -251,7 +242,7 @@ if __name__ == "__main__":
         for _, c in clients.items():
             local_model = copy.deepcopy(net_glob)
             if c.final_parameters is not None:
-                if c.rec_mask_rate is not None and c.rec_mask_rate > config.mask_rate_list[2]:
+                if c.rec_mask_rate is not None and c.rec_mask_rate > config.mask_rate_list[1]:
                     local_params = copy.deepcopy(c.final_parameters)
                 else:
                     local_params = copy.deepcopy(local_model.state_dict())
