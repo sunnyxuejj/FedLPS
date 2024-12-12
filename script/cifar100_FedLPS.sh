@@ -8,6 +8,4 @@ python FedLPS.py --dataset 'cifar100' \
 --frac 0.2 \
 --local_ep 5 \
 --local_bs 20 \
---momentum 0.5 \
---online_decision True \
 --lr 0.1
